@@ -1,0 +1,755 @@
+"""Helpers for detecting and exporting Roblox document files."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import gzip
+import importlib
+import re
+import struct
+import zlib
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+from defusedxml import ElementTree as DefusedElementTree
+from defusedxml.common import DefusedXmlException
+from defusedxml.ElementTree import ParseError
+
+if TYPE_CHECKING:
+    import xml.etree.ElementTree as ET
+    from collections.abc import Callable
+
+from .tools.solidmodel_converter.rbxm import deserializer as rbxm_deserializer
+from .tools.solidmodel_converter.rbxm.binary_reader import read_string
+from .tools.solidmodel_converter.rbxm.deserializer import RbxmDeserializer
+from .tools.solidmodel_converter.rbxm.serializer import write_rbxm
+from .tools.solidmodel_converter.rbxm.types import (
+    PROPERTY_FORMAT_TO_XML_TAG,
+    PropertyFormat,
+    RbxDocument,
+    RbxInstance,
+    RbxMetadata,
+    RbxProperty,
+)
+from .tools.solidmodel_converter.rbxm.xml_writer import write_rbxmx
+
+RBXM_MAGIC = b'<roblox!\x89\xff\x0d\x0a\x1a\x0a'
+PLACE_ASSET_TYPE = 9
+
+type RobloxDocumentKind = Literal['rbxm', 'rbxmx', 'rbxl']
+type NumberCaster = type[int | float]
+
+_decompress_chunk: Callable[[bytes, int], bytes] = vars(rbxm_deserializer)['_decompress_chunk']
+
+
+def _rbxm_parse_errors() -> tuple[type[Exception], ...]:
+    errors: list[type[Exception]] = [
+        IndexError,
+        KeyError,
+        RuntimeError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        struct.error,
+    ]
+    for module_name, exception_name in (
+        ('lz4.block', 'LZ4BlockError'),
+        ('zstandard', 'ZstdError'),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        error_type = cast('type[Exception]', vars(module)[exception_name])
+        errors.append(error_type)
+    return tuple(errors)
+
+
+_RBXM_PARSE_ERRORS = _rbxm_parse_errors()
+
+
+def decompress_if_needed(data: bytes) -> bytes:
+    """Return decompressed document bytes when the cache stored a gzip wrapper."""
+    if data.startswith(b'\x1f\x8b'):
+        return gzip.decompress(data)
+    return data
+
+
+def classify_roblox_document(data: bytes) -> RobloxDocumentKind | None:
+    """Classify bytes as rbxm, rbxmx, rbxl, or not a Roblox document."""
+    try:
+        data = decompress_if_needed(data)
+    except EOFError, OSError, zlib.error:
+        return None
+
+    if data.startswith(RBXM_MAGIC):
+        return 'rbxl' if _binary_contains_class(data, 'DataModel') else 'rbxm'
+
+    root = _parse_roblox_xml(data)
+    if root is not None:
+        if not _xml_contains_item(root):
+            return None
+        return 'rbxl' if _xml_contains_datamodel(root) else 'rbxmx'
+
+    return None
+
+
+def get_roblox_document_export_formats(data: bytes, asset_type: int | None = None) -> list[str]:
+    """Return converted export formats for a Roblox document payload."""
+    kind = classify_roblox_document(data)
+    if asset_type == PLACE_ASSET_TYPE and kind in {'rbxl', 'rbxm', 'rbxmx'}:
+        return ['converted_document_rbxl']
+    if kind == 'rbxl':
+        return ['converted_document_rbxl']
+    if kind in {'rbxm', 'rbxmx'}:
+        return ['converted_document_rbxm', 'converted_document_rbxmx']
+    return []
+
+
+def get_default_roblox_document_export_format(
+    data: bytes, asset_type: int | None = None
+) -> str | None:
+    """Return the best default converted export format for a Roblox document."""
+    kind = classify_roblox_document(data)
+    if asset_type == PLACE_ASSET_TYPE and kind in {'rbxl', 'rbxm', 'rbxmx'}:
+        return 'converted_document_rbxl'
+    if kind == 'rbxl':
+        return 'converted_document_rbxl'
+    if kind == 'rbxmx':
+        return 'converted_document_rbxmx'
+    if kind == 'rbxm':
+        return 'converted_document_rbxm'
+    return None
+
+
+def export_roblox_document(
+    data: bytes,
+    export_format: str,
+    asset_type: int | None = None,
+) -> tuple[bytes, str]:
+    """Convert a Roblox document payload to the requested export format."""
+    data = decompress_if_needed(data)
+    kind = classify_roblox_document(data)
+    if kind is None:
+        msg = 'Data is not an RBXM/RBXMX/RBXL document'
+        raise ValueError(msg)
+
+    if export_format == 'converted_document_rbxl':
+        if kind != 'rbxl' and asset_type != PLACE_ASSET_TYPE:
+            msg = 'Only DataModel documents can be exported as RBXL'
+            raise ValueError(msg)
+        return _to_binary_document(data), '.rbxl'
+
+    if export_format == 'converted_document_rbxm':
+        if kind == 'rbxl' or asset_type == PLACE_ASSET_TYPE:
+            msg = 'RBXL documents must be exported as RBXL'
+            raise ValueError(msg)
+        return _to_binary_document(data), '.rbxm'
+
+    if export_format == 'converted_document_rbxmx':
+        if kind == 'rbxl' or asset_type == PLACE_ASSET_TYPE:
+            msg = 'RBXL documents must be exported as RBXL'
+            raise ValueError(msg)
+        if _parse_roblox_xml(data) is not None:
+            return data, '.rbxmx'
+        return write_rbxmx(RbxmDeserializer().deserialize(data)), '.rbxmx'
+
+    msg = f'Unsupported Roblox document export format: {export_format}'
+    raise ValueError(msg)
+
+
+def _to_binary_document(data: bytes) -> bytes:
+    if data.startswith(RBXM_MAGIC):
+        return data
+    return write_rbxm(_xml_to_document(data))
+
+
+def _document_contains_datamodel(doc: RbxDocument) -> bool:
+    return any(inst.class_name == 'DataModel' for inst in doc.instances.values())
+
+
+def _scan_binary_chunks_for_class(data: bytes, class_name: str) -> bool:
+    offset = 32
+    while offset + 16 <= len(data):
+        chunk_name = data[offset : offset + 4].decode('ascii')
+        compressed_size = struct.unpack_from('<I', data, offset + 4)[0]
+        uncompressed_size = struct.unpack_from('<I', data, offset + 8)[0]
+        offset += 16
+
+        if chunk_name == 'END\x00':
+            break
+
+        if compressed_size == 0:
+            chunk_start = offset
+            offset += uncompressed_size
+            if chunk_name != 'INST':
+                continue
+            chunk_data = data[chunk_start:offset]
+        else:
+            raw = data[offset : offset + compressed_size]
+            offset += compressed_size
+            if chunk_name != 'INST':
+                continue
+            chunk_data = _decompress_chunk(raw, uncompressed_size)
+
+        found_class, _ = read_string(chunk_data, 4)
+        if found_class == class_name:
+            return True
+    return False
+
+
+def _binary_contains_class(data: bytes, class_name: str) -> bool:
+    try:
+        return _scan_binary_chunks_for_class(data, class_name)
+    except _RBXM_PARSE_ERRORS:
+        try:
+            return _document_contains_datamodel(RbxmDeserializer().deserialize(data))
+        except _RBXM_PARSE_ERRORS:
+            return False
+
+
+def _xml_contains_datamodel(root: ET.Element) -> bool:
+    return any(
+        _tag_name(elem) == 'Item' and elem.get('class') == 'DataModel' for elem in root.iter()
+    )
+
+
+def _xml_contains_item(root: ET.Element) -> bool:
+    return any(_tag_name(elem) == 'Item' for elem in root.iter())
+
+
+def _parse_roblox_xml(data: bytes) -> ET.Element | None:
+    stripped = data.lstrip()
+    if stripped.startswith(b'\xef\xbb\xbf'):
+        stripped = stripped[3:].lstrip()
+    if not stripped.startswith(b'<'):
+        return None
+    try:
+        root = DefusedElementTree.fromstring(data)
+    except ParseError, DefusedXmlException:
+        return None
+    if _tag_name(root) != 'roblox':
+        return None
+    return root
+
+
+def _xml_to_document(data: bytes) -> RbxDocument:
+    root = DefusedElementTree.fromstring(data)
+    if _tag_name(root) != 'roblox':
+        msg = 'XML root is not a Roblox document'
+        raise ValueError(msg)
+
+    shared_by_md5: dict[str, bytes] = {}
+    shared_strings: list[bytes] = []
+    ss_root = _find_child(root, 'SharedStrings')
+    if ss_root is not None:
+        for shared in _children_named(ss_root, 'SharedString'):
+            text = (shared.text or '').strip()
+            blob = b''
+            if text:
+                try:
+                    blob = base64.b64decode(text)
+                except binascii.Error, ValueError:
+                    blob = text.encode('utf-8', errors='replace')
+            md5 = shared.get('md5') or ''
+            if md5:
+                shared_by_md5[md5] = blob
+            shared_strings.append(blob)
+
+    ref_map: dict[str, int] = {}
+    next_ref = 1
+
+    def mapped_ref(ref: str) -> int:
+        nonlocal next_ref
+        if ref in ref_map:
+            return ref_map[ref]
+        try:
+            value = int(ref)
+        except ValueError:
+            while next_ref in ref_map.values():
+                next_ref += 1
+            value = next_ref
+            next_ref += 1
+        ref_map[ref] = value
+        return value
+
+    instances: dict[int, RbxInstance] = {}
+
+    def parse_item(item: ET.Element) -> RbxInstance:
+        referent_text = item.get('referent') or ''
+        referent = mapped_ref(referent_text)
+        inst = RbxInstance(class_name=item.get('class') or 'Folder', referent=referent)
+        instances[referent] = inst
+
+        props_elem = _find_child(item, 'Properties')
+        if props_elem is not None:
+            for prop_elem in list(props_elem):
+                prop_name = prop_elem.get('name') or ''
+                if not prop_name:
+                    continue
+                type_name = _tag_name(prop_elem)
+                fmt = _property_format_from_type_name(type_name)
+                if fmt is None:
+                    continue
+                value = _xml_property_value(prop_elem, type_name, shared_by_md5)
+                inst.properties[prop_name] = RbxProperty(
+                    name=prop_name,
+                    fmt=fmt,
+                    value=_value_for_format(value, fmt, mapped_ref),
+                )
+
+        inst.children = [parse_item(child) for child in _children_named(item, 'Item')]
+        return inst
+
+    roots = [parse_item(item) for item in _children_named(root, 'Item')]
+    metadata = {
+        elem.get('name') or _tag_name(elem): (elem.text or '').strip()
+        for elem in list(root)
+        if _tag_name(elem) == 'Meta'
+    }
+
+    return RbxDocument(
+        version=0,
+        type_count=0,
+        object_count=len(instances),
+        metadata=RbxMetadata(entries=metadata),
+        instances=instances,
+        roots=roots,
+        shared_strings=shared_strings,
+    )
+
+
+def _decode_binary_property(text: str) -> bytes:
+    stripped = text.strip()
+    if not stripped:
+        return b''
+    try:
+        return base64.b64decode(stripped)
+    except binascii.Error, ValueError:
+        return stripped.encode('utf-8', errors='replace')
+
+
+def _xml_property_value(
+    elem: ET.Element,
+    type_name: str,
+    shared_by_md5: dict[str, bytes],
+) -> str | bytes | dict[str, str]:
+    text = elem.text or ''
+    if type_name == 'SharedString':
+        return shared_by_md5.get(text.strip(), b'')
+    if type_name == 'BinaryString':
+        return _decode_binary_property(text)
+    if type_name == 'ProtectedString':
+        return text
+    children = list(elem)
+    if children:
+        return {_tag_name(child): (child.text or '').strip() for child in children}
+    return text.strip()
+
+
+def _property_format_from_type_name(type_name: str) -> PropertyFormat | None:
+    normalized = type_name.strip()
+    if not normalized:
+        return PropertyFormat.STRING
+    upper = normalized.upper()
+    if upper in PropertyFormat.__members__:
+        return PropertyFormat[upper]
+
+    tag_to_format = {tag.lower(): fmt for fmt, tag in PROPERTY_FORMAT_TO_XML_TAG.items()}
+    aliases = {
+        'class': None,
+        'refid': None,
+        'binarystring': PropertyFormat.STRING,
+        'protectedstring': PropertyFormat.STRING,
+        'content': PropertyFormat.CONTENT,
+        'token': PropertyFormat.ENUM,
+        'optionalcoordinateframe': PropertyFormat.OPTIONAL_CFRAME,
+        'uniqueid': PropertyFormat.UNIQUE_ID,
+        'securitycapabilities': PropertyFormat.SECURITY_CAPABILITIES,
+    }
+    key = normalized.lower()
+    if key in aliases:
+        return aliases[key]
+    return tag_to_format.get(key, PropertyFormat.STRING)
+
+
+def _reference_value(value: Any, ref_mapper: Callable[[str], int]) -> int | None:
+    if value is None:
+        return None
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        value = value_map.get('Ref') or value_map.get('referent') or value_map.get('id')
+    text = str(value or '').strip()
+    if text in {'', 'None', '-1', 'null'}:
+        return None
+    if '->' in text:
+        text = text.split('->', 1)[0].strip()
+    return ref_mapper(text)
+
+
+def _unique_id_value(value: Any) -> Any:
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        return value_map
+    if isinstance(value, bytes):
+        return value
+    text = str(value).strip().replace('-', '')
+    if len(text) == 32:
+        try:
+            xml_random = int(text[:16], 16)
+            random_bits = (xml_random >> 1) | ((xml_random & 1) << 63)
+            return {
+                'Index': int(text[24:32], 16),
+                'Time': int(text[16:24], 16),
+                'Random': random_bits,
+            }
+        except ValueError:
+            pass
+    return {'Index': 0, 'Time': 0, 'Random': 0}
+
+
+def _content_value(value: Any, ref_mapper: Callable[[str], int]) -> Any:
+    value_map = _as_property_dict(value)
+    if value_map is None:
+        if value is None:
+            return value
+        text = str(value)
+        return {'SourceType': 'Uri', 'Uri': text} if text else None
+
+    uri = value_map.get('Uri') or value_map.get('uri') or value_map.get('url')
+    if uri:
+        return {'SourceType': 'Uri', 'Uri': str(uri)}
+    ref = value_map.get('Ref')
+    if ref is not None:
+        return {'SourceType': 'Object', 'Ref': ref_mapper(str(ref))}
+    return None if 'null' in value_map else value_map
+
+
+def _value_for_format(value: Any, fmt: PropertyFormat, ref_mapper: Callable[[str], int]) -> Any:
+    if fmt in {
+        PropertyFormat.INT,
+        PropertyFormat.INT64,
+        PropertyFormat.ENUM,
+        PropertyFormat.BRICK_COLOR,
+        PropertyFormat.SECURITY_CAPABILITIES,
+    }:
+        result: Any = _safe_int(value)
+    elif fmt in {PropertyFormat.FLOAT, PropertyFormat.DOUBLE}:
+        result = _safe_float(value)
+    elif fmt == PropertyFormat.BOOL:
+        result = _safe_bool(value)
+    elif fmt == PropertyFormat.REF:
+        result = _reference_value(value, ref_mapper)
+    elif fmt == PropertyFormat.UNIQUE_ID:
+        result = _unique_id_value(value)
+    elif fmt == PropertyFormat.CONTENT:
+        result = _content_value(value, ref_mapper)
+    elif fmt == PropertyFormat.UDIM:
+        result = _parse_udim_value(value)
+    elif fmt == PropertyFormat.UDIM2:
+        result = _parse_udim2_value(value)
+    elif fmt == PropertyFormat.RAY:
+        result = _parse_ray_value(value)
+    elif fmt == PropertyFormat.COLOR3:
+        result = _parse_vector_value(value, ('R', 'G', 'B'), float)
+    elif fmt == PropertyFormat.VECTOR2:
+        result = _parse_vector_value(value, ('X', 'Y'), float)
+    elif fmt == PropertyFormat.VECTOR3:
+        result = _parse_vector_value(value, ('X', 'Y', 'Z'), float)
+    elif fmt == PropertyFormat.VECTOR2INT16:
+        result = _parse_vector_value(value, ('X', 'Y'), int)
+    elif fmt == PropertyFormat.VECTOR3INT16:
+        result = _parse_vector_value(value, ('X', 'Y', 'Z'), int)
+    elif fmt in {
+        PropertyFormat.CFRAME_MATRIX,
+        PropertyFormat.CFRAME_QUAT,
+        PropertyFormat.OPTIONAL_CFRAME,
+    }:
+        result = _parse_cframe_value(value)
+    elif fmt == PropertyFormat.NUMBER_RANGE:
+        result = _parse_number_range_value(value)
+    elif fmt == PropertyFormat.RECT2D:
+        result = _parse_rect2d_value(value)
+    elif fmt == PropertyFormat.PHYSICAL_PROPERTIES:
+        result = _parse_physical_properties_value(value)
+    elif fmt == PropertyFormat.COLOR3UINT8:
+        result = _parse_vector_value(value, ('R', 'G', 'B'), int)
+    elif fmt == PropertyFormat.FONT:
+        result = _parse_font_value(value)
+    else:
+        result = value
+    return result
+
+
+def _parse_udim_value(value: Any) -> dict[str, float | int]:
+    value_map = _as_property_dict(value)
+    pairs: dict[str, Any]
+    if value_map is not None:
+        pairs = {str(key): item for key, item in value_map.items()}
+    else:
+        pairs = _parse_key_values(str(value))
+    if pairs:
+        return {
+            'S': _safe_float(pairs.get('S', 0.0)),
+            'O': _safe_int(pairs.get('O', 0)),
+        }
+    numbers = _parse_numbers(str(value))
+    return {
+        'S': numbers[0] if len(numbers) > 0 else 0.0,
+        'O': int(numbers[1]) if len(numbers) > 1 else 0,
+    }
+
+
+def _parse_udim2_value(value: Any) -> dict[str, float | int]:
+    value_map = _as_property_dict(value)
+    pairs: dict[str, Any]
+    if value_map is not None:
+        pairs = {str(key): item for key, item in value_map.items()}
+    else:
+        pairs = _parse_key_values(str(value))
+    if pairs:
+        return {
+            'XS': _safe_float(pairs.get('XS', 0.0)),
+            'XO': _safe_int(pairs.get('XO', 0)),
+            'YS': _safe_float(pairs.get('YS', 0.0)),
+            'YO': _safe_int(pairs.get('YO', 0)),
+        }
+    numbers = _parse_numbers(str(value))
+    return {
+        'XS': numbers[0] if len(numbers) > 0 else 0.0,
+        'XO': int(numbers[1]) if len(numbers) > 1 else 0,
+        'YS': numbers[2] if len(numbers) > 2 else 0.0,
+        'YO': int(numbers[3]) if len(numbers) > 3 else 0,
+    }
+
+
+def _parse_vector_value(
+    value: Any, keys: tuple[str, ...], caster: NumberCaster
+) -> dict[str, int | float]:
+    value_map = _as_property_dict(value)
+    pairs: dict[str, Any]
+    if value_map is not None:
+        pairs = {str(key): item for key, item in value_map.items()}
+    else:
+        pairs = _parse_key_values(str(value))
+    if pairs:
+        return {key: _cast_number(pairs.get(key, 0), caster) for key in keys}
+    numbers = _parse_numbers(str(value))
+    return {
+        key: _cast_number(numbers[index] if index < len(numbers) else 0, caster)
+        for index, key in enumerate(keys)
+    }
+
+
+def _parse_ray_value(value: Any) -> dict[str, dict[str, int | float]]:
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        return {
+            'origin': _parse_vector_value(value_map.get('origin', {}), ('X', 'Y', 'Z'), float),
+            'direction': _parse_vector_value(
+                value_map.get('direction', {}), ('X', 'Y', 'Z'), float
+            ),
+        }
+    numbers = _parse_numbers(str(value))
+    padded = numbers + [0.0] * max(0, 6 - len(numbers))
+    return {
+        'origin': {'X': padded[0], 'Y': padded[1], 'Z': padded[2]},
+        'direction': {'X': padded[3], 'Y': padded[4], 'Z': padded[5]},
+    }
+
+
+def _parse_cframe_value(value: Any) -> dict[str, float] | None:
+    text = str(value).strip()
+    if value is None or text.lower() in {'', 'none', 'null'}:
+        return None
+    result = {
+        'X': 0.0,
+        'Y': 0.0,
+        'Z': 0.0,
+        'R00': 1.0,
+        'R01': 0.0,
+        'R02': 0.0,
+        'R10': 0.0,
+        'R11': 1.0,
+        'R12': 0.0,
+        'R20': 0.0,
+        'R21': 0.0,
+        'R22': 1.0,
+    }
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        result.update({key: _safe_float(value_map.get(key, result[key])) for key in result})
+        return result
+    pairs = _parse_key_values(text)
+    if pairs:
+        for key in result:
+            if key in pairs:
+                result[key] = _safe_float(pairs[key])
+        return result
+    numbers = _parse_numbers(text)
+    if len(numbers) >= 12:
+        result.update(zip(result, numbers[:12], strict=False))
+    elif len(numbers) >= 3:
+        result['X'], result['Y'], result['Z'] = numbers[:3]
+    return result
+
+
+def _parse_number_range_value(value: Any) -> dict[str, float]:
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        return {
+            'Min': _safe_float(value_map.get('Min', 0.0)),
+            'Max': _safe_float(value_map.get('Max', 0.0)),
+        }
+    pairs = _parse_key_values(str(value))
+    if pairs:
+        return {
+            'Min': _safe_float(pairs.get('Min', 0.0)),
+            'Max': _safe_float(pairs.get('Max', 0.0)),
+        }
+    numbers = _parse_numbers(str(value))
+    return {
+        'Min': numbers[0] if len(numbers) > 0 else 0.0,
+        'Max': numbers[1] if len(numbers) > 1 else 0.0,
+    }
+
+
+def _parse_rect2d_value(value: Any) -> dict[str, dict[str, int | float]]:
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        return {
+            'min': _parse_vector_value(value_map.get('min', {}), ('X', 'Y'), float),
+            'max': _parse_vector_value(value_map.get('max', {}), ('X', 'Y'), float),
+        }
+    numbers = _parse_numbers(str(value))
+    padded = numbers + [0.0] * max(0, 4 - len(numbers))
+    return {
+        'min': {'X': padded[0], 'Y': padded[1]},
+        'max': {'X': padded[2], 'Y': padded[3]},
+    }
+
+
+def _parse_physical_properties_value(value: Any) -> dict[str, bool | float] | None:
+    text = str(value).strip()
+    if value is None or text.lower() in {'', 'none', 'null', 'default'}:
+        return None
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        return {
+            'CustomPhysics': _safe_bool(value_map.get('CustomPhysics', True)),
+            'Density': _safe_float(value_map.get('Density', 0.0)),
+            'Friction': _safe_float(value_map.get('Friction', 0.0)),
+            'Elasticity': _safe_float(value_map.get('Elasticity', 0.0)),
+            'FrictionWeight': _safe_float(value_map.get('FrictionWeight', 0.0)),
+            'ElasticityWeight': _safe_float(value_map.get('ElasticityWeight', 0.0)),
+            'AcousticAbsorption': _safe_float(value_map.get('AcousticAbsorption', 1.0)),
+        }
+    pairs = _parse_key_values(text)
+    if pairs:
+        return _parse_physical_properties_value(pairs)
+    numbers = _parse_numbers(text)
+    if len(numbers) < 5:
+        return None
+    result: dict[str, bool | float] = {
+        'CustomPhysics': True,
+        'Density': numbers[0],
+        'Friction': numbers[1],
+        'Elasticity': numbers[2],
+        'FrictionWeight': numbers[3],
+        'ElasticityWeight': numbers[4],
+    }
+    if len(numbers) > 5:
+        result['AcousticAbsorption'] = numbers[5]
+    return result
+
+
+def _parse_font_value(value: Any) -> dict[str, str | int]:
+    value_map = _as_property_dict(value)
+    if value_map is not None:
+        return {
+            'Family': str(value_map.get('Family', '')),
+            'Weight': _safe_int(value_map.get('Weight', 400)),
+            'Style': _safe_int(value_map.get('Style', 0)),
+            'CachedFaceId': str(value_map.get('CachedFaceId', '')),
+        }
+    pairs = _parse_key_values(str(value))
+    if pairs:
+        return _parse_font_value(pairs)
+    parts = [part.strip() for part in str(value).split(',')]
+    return {
+        'Family': parts[0] if len(parts) > 0 else '',
+        'Weight': _safe_int(parts[1] if len(parts) > 1 else 400),
+        'Style': _safe_int(parts[2] if len(parts) > 2 else 0),
+        'CachedFaceId': parts[3] if len(parts) > 3 else '',
+    }
+
+
+def _parse_key_values(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for part in re.split(r'[,;]\s*', text.strip().strip('[]{}()')):
+        if '=' in part:
+            key, raw_value = part.split('=', 1)
+        elif ':' in part:
+            key, raw_value = part.split(':', 1)
+        else:
+            continue
+        key = key.strip().strip('"\'{}[]()')
+        raw_value = raw_value.strip().strip('"\'{}[]()')
+        if key:
+            result[key] = raw_value
+    return result
+
+
+def _parse_numbers(text: str) -> list[float]:
+    return [
+        float(match.group(0))
+        for match in re.finditer(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?', text)
+    ]
+
+
+def _cast_number(value: Any, caster: NumberCaster) -> int | float:
+    number = float(value)
+    if caster is int:
+        return round(number)
+    return number
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(str(value).strip(), 0)
+    except TypeError, ValueError:
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except TypeError, ValueError:
+        return 0.0
+
+
+def _safe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _as_property_dict(value: Any) -> dict[Any, Any] | None:
+    if isinstance(value, dict):
+        return cast('dict[Any, Any]', value)
+    return None
+
+
+def _find_child(parent: ET.Element, name: str) -> ET.Element | None:
+    for child in list(parent):
+        if _tag_name(child) == name:
+            return child
+    return None
+
+
+def _children_named(parent: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in list(parent) if _tag_name(child) == name]
+
+
+def _tag_name(elem: ET.Element) -> str:
+    return elem.tag.rsplit('}', 1)[-1]

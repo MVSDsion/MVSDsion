@@ -1,0 +1,439 @@
+"""Asset-type filter popup shared by UI surfaces that should avoid OpenGL imports."""
+
+from __future__ import annotations
+
+from typing import override
+
+from PySide6.QtCore import QRect, QSignalBlocker, QSize, Qt, Signal
+from PySide6.QtGui import QFontMetrics, QMouseEvent
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QMenu,
+    QPushButton,
+    QScrollArea,
+    QStyle,
+    QVBoxLayout,
+    QWidget,
+    QWidgetAction,
+)
+
+from fleasion.localization import tr
+
+type AssetType = int | str
+
+
+_CATEGORY_TYPES: dict[str, list[AssetType]] = {
+    'models_3d': [4, 10, 39, 40, 32, 17, 79, 75],
+    'images_textures': [1, 13, 63, 21, 22, 18],
+    'audio_video': [3, 62, 33],
+    'animations': [
+        24,
+        'R6Animation',
+        'R15Animation',
+        'NonPlayerAnimation',
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        61,
+        78,
+    ],
+    'avatar_parts': [16, 25, 26, 27, 28, 29, 30, 31],
+    'clothing': [2, 11, 12, 8, 19],
+    'accessories': [41, 42, 43, 44, 45, 46, 47, 57, 58, 64, 65, 66, 67, 68, 69, 70, 71, 72, 76, 77],
+    'scripts_data': [5, 6, 7, 37, 38, 80, 59, 74, 73, 35, 34, 9, 'Json'],
+}
+
+
+def _category_label(category: str) -> str:
+    return {
+        'models_3d': tr('asset_filter.category.models_3d'),
+        'images_textures': tr('asset_filter.category.images_textures'),
+        'audio_video': tr('asset_filter.category.audio_video'),
+        'animations': tr('asset_filter.category.animations'),
+        'avatar_parts': tr('asset_filter.category.avatar_parts'),
+        'clothing': tr('asset_filter.category.clothing'),
+        'accessories': tr('asset_filter.category.accessories'),
+        'scripts_data': tr('asset_filter.category.scripts_data'),
+    }[category]
+
+
+def asset_type_display_name(type_id: AssetType) -> str:
+    if type_id == 'R6Animation':
+        return tr('asset_filter.type.r6_animation')
+    if type_id == 'R15Animation':
+        return tr('asset_filter.type.r15_animation')
+    if type_id == 'NonPlayerAnimation':
+        return tr('asset_filter.type.non_player_animation')
+    if type_id == 'Json':
+        return tr('asset_filter.type.json')
+    labels: dict[AssetType, str] = {
+        1: tr('asset_filter.type.1'),
+        2: tr('asset_filter.type.2'),
+        3: tr('asset_filter.type.3'),
+        4: tr('asset_filter.type.4'),
+        5: tr('asset_filter.type.5'),
+        6: tr('asset_filter.type.6'),
+        7: tr('asset_filter.type.7'),
+        8: tr('asset_filter.type.8'),
+        9: tr('asset_filter.type.9'),
+        10: tr('asset_filter.type.10'),
+        11: tr('asset_filter.type.11'),
+        12: tr('asset_filter.type.12'),
+        13: tr('asset_filter.type.13'),
+        16: tr('asset_filter.type.16'),
+        17: tr('asset_filter.type.17'),
+        18: tr('asset_filter.type.18'),
+        19: tr('asset_filter.type.19'),
+        21: tr('asset_filter.type.21'),
+        22: tr('asset_filter.type.22'),
+        24: tr('asset_filter.type.24'),
+        25: tr('asset_filter.type.25'),
+        26: tr('asset_filter.type.26'),
+        27: tr('asset_filter.type.27'),
+        28: tr('asset_filter.type.28'),
+        29: tr('asset_filter.type.29'),
+        30: tr('asset_filter.type.30'),
+        31: tr('asset_filter.type.31'),
+        32: tr('asset_filter.type.32'),
+        33: tr('asset_filter.type.33'),
+        34: tr('asset_filter.type.34'),
+        35: tr('asset_filter.type.35'),
+        37: tr('asset_filter.type.37'),
+        38: tr('asset_filter.type.38'),
+        39: tr('asset_filter.type.39'),
+        40: tr('asset_filter.type.40'),
+        41: tr('asset_filter.type.41'),
+        42: tr('asset_filter.type.42'),
+        43: tr('asset_filter.type.43'),
+        44: tr('asset_filter.type.44'),
+        45: tr('asset_filter.type.45'),
+        46: tr('asset_filter.type.46'),
+        47: tr('asset_filter.type.47'),
+        48: tr('asset_filter.type.48'),
+        49: tr('asset_filter.type.49'),
+        50: tr('asset_filter.type.50'),
+        51: tr('asset_filter.type.51'),
+        52: tr('asset_filter.type.52'),
+        53: tr('asset_filter.type.53'),
+        54: tr('asset_filter.type.54'),
+        55: tr('asset_filter.type.55'),
+        56: tr('asset_filter.type.56'),
+        57: tr('asset_filter.type.57'),
+        58: tr('asset_filter.type.58'),
+        59: tr('asset_filter.type.59'),
+        61: tr('asset_filter.type.61'),
+        62: tr('asset_filter.type.62'),
+        63: tr('asset_filter.type.63'),
+        64: tr('asset_filter.type.64'),
+        65: tr('asset_filter.type.65'),
+        66: tr('asset_filter.type.66'),
+        67: tr('asset_filter.type.67'),
+        68: tr('asset_filter.type.68'),
+        69: tr('asset_filter.type.69'),
+        70: tr('asset_filter.type.70'),
+        71: tr('asset_filter.type.71'),
+        72: tr('asset_filter.type.72'),
+        73: tr('asset_filter.type.73'),
+        74: tr('asset_filter.type.74'),
+        75: tr('asset_filter.type.75'),
+        76: tr('asset_filter.type.76'),
+        77: tr('asset_filter.type.77'),
+        78: tr('asset_filter.type.78'),
+        79: tr('asset_filter.type.79'),
+        80: tr('asset_filter.type.80'),
+    }
+    return labels.get(type_id, str(type_id))
+
+
+class CategoryFilterPopup(QMenu):
+    filters_changed = Signal(set)
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        active_filters: set[AssetType] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._sync_surface_stylesheet()
+        self.aboutToShow.connect(self._sync_surface_stylesheet)
+
+        self.active_filters: set[AssetType] = set(active_filters) if active_filters else set()
+        self._updating = False
+
+        self.container = QWidget()
+        self.container.setObjectName('FilterContainer')
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(4)
+
+        self.categories: dict[str, list[AssetType]] = {
+            key: list(type_ids) for key, type_ids in _CATEGORY_TYPES.items()
+        }
+
+        self.checkboxes: dict[AssetType, QCheckBox] = {}
+        self.category_checkboxes: dict[str, QCheckBox] = {}
+
+        col = 0
+        row = 0
+        fm = QFontMetrics(self.font())
+
+        for cat_name, type_ids in self.categories.items():
+            cat_frame = QFrame()
+            cat_frame.setObjectName('CategoryCard')
+            cat_frame.setStyleSheet("""
+                QFrame#CategoryCard {
+                    border: 1px solid palette(mid);
+                    border-radius: 6px;
+                    background-color: palette(base);
+                }
+            """)
+            vbox = QVBoxLayout(cat_frame)
+            vbox.setContentsMargins(6, 6, 6, 6)
+            vbox.setSpacing(3)
+
+            cat_cb = QCheckBox(_category_label(cat_name))
+            cat_cb.setStyleSheet('font-weight: bold; color: #55aaff;')
+            cat_cb.setTristate(True)
+            self.category_checkboxes[cat_name] = cat_cb
+            vbox.addWidget(cat_cb)
+
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            line.setStyleSheet(
+                'background-color: palette(mid); margin-bottom: 2px; margin-top: 2px;'
+            )
+            vbox.addWidget(line)
+
+            cat_types: list[AssetType] = []
+            for tid in type_ids:
+                name = asset_type_display_name(tid)
+                elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, 130)
+                cb = QCheckBox(elided)
+                if elided != name:
+                    cb.setToolTip(name)
+                cb.setChecked(tid in self.active_filters)
+                self.checkboxes[tid] = cb
+                vbox.addWidget(cb)
+                cat_types.append(tid)
+
+            def toggle_category(
+                _checked: bool = False,
+                category_types: list[AssetType] = cat_types,
+                category_name: str = cat_name,
+            ) -> None:
+                self._on_category_clicked(category_types, category_name)
+
+            cat_cb.clicked.connect(toggle_category)
+            for tid in cat_types:
+                cb = self.checkboxes[tid]
+
+                def toggle_type(
+                    checked: bool = False,
+                    type_id: AssetType = tid,
+                    category_name: str = cat_name,
+                ) -> None:
+                    self._on_type_clicked(type_id, category_name, checked)
+
+                cb.clicked.connect(toggle_type)
+
+            self._update_category_state(cat_name)
+            vbox.addStretch()
+            grid.addWidget(cat_frame, row, col)
+            col += 1
+            if col >= 4:
+                col = 0
+                row += 1
+
+        layout.addLayout(grid)
+
+        btn_layout = QHBoxLayout()
+        clear_btn = QPushButton(tr('ui.cache.asset_type_filter.clear_filters'))
+        clear_btn.setStyleSheet(
+            'padding: 5px 15px; border: 1px solid palette(mid); border-radius: 3px;'
+        )
+        clear_btn.clicked.connect(self._clear_all)
+        btn_layout.addWidget(clear_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName('FilterScrollArea')
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setWidget(self.container)
+
+        self._natural_content_size = self.container.sizeHint()
+        self._set_popup_content_size(self._natural_content_size.height())
+
+        action = QWidgetAction(self)
+        action.setDefaultWidget(self.scroll_area)
+        self.addAction(action)
+
+    def _sync_surface_stylesheet(self) -> None:
+        """Use an opaque palette role even when Glass makes Window transparent."""
+        surface = self.palette().window().color()
+        if surface.alpha() == 0:
+            surface = self.palette().toolTipBase().color()
+        color = surface.name()
+        stylesheet = f"""
+            QMenu {{ background-color: {color}; border: 1px solid palette(mid); border-radius: 4px; color: palette(window-text); }}
+            QWidget#FilterContainer {{ background-color: {color}; }}
+            QCheckBox {{ padding: 1px; color: palette(window-text); font-size: 12px; }}
+            QCheckBox::indicator {{ width: 14px; height: 14px; }}
+        """
+        if self.styleSheet() != stylesheet:
+            self.setStyleSheet(stylesheet)
+
+    def _popup_insets(self) -> tuple[int, int]:
+        style = self.style()
+        panel = style.pixelMetric(QStyle.PixelMetric.PM_MenuPanelWidth, None, self)
+        horizontal = style.pixelMetric(QStyle.PixelMetric.PM_MenuHMargin, None, self)
+        vertical = style.pixelMetric(QStyle.PixelMetric.PM_MenuVMargin, None, self)
+        return panel + horizontal, panel + vertical
+
+    @override
+    def sizeHint(self) -> QSize:
+        """Size the menu and its embedded widget together, including style margins."""
+        if self._natural_content_size.isValid() and self.scroll_area.size().isValid():
+            horizontal, vertical = self._popup_insets()
+            return QSize(
+                self.scroll_area.width() + 2 * horizontal,
+                self.scroll_area.height() + 2 * vertical,
+            )
+        return super().sizeHint()
+
+    def _set_popup_content_size(self, max_height: int, *, max_width: int | None = None) -> None:
+        natural = self._natural_content_size
+        height = min(natural.height(), max(1, max_height))
+        width = natural.width()
+        if natural.height() > height:
+            width += self.scroll_area.verticalScrollBar().sizeHint().width()
+        if max_width is not None:
+            width = min(width, max(1, max_width))
+        self.scroll_area.setFixedSize(max(1, width), max(1, height))
+        self.scroll_area.updateGeometry()
+        self.updateGeometry()
+
+    def constrain_to_available_geometry(
+        self, available_geometry: QRect | None, anchor_y: int | None = None
+    ) -> None:
+        """Bound the popup to the visible screen area and enable vertical scroll."""
+        if available_geometry is None:
+            return
+
+        if anchor_y is None:
+            available_height = available_geometry.height()
+        else:
+            space_below = available_geometry.bottom() - anchor_y
+            space_above = anchor_y - available_geometry.top()
+            available_height = max(space_below, space_above)
+
+        horizontal, vertical = self._popup_insets()
+        max_height = max(1, available_height - 12 - 2 * vertical)
+        max_width = max(1, available_geometry.width() - 12 - 2 * horizontal)
+        self._set_popup_content_size(max_height, max_width=max_width)
+        self.adjustSize()
+        self.resize(self.sizeHint())
+        self.updateGeometry()
+
+    def set_active_filters(self, active_filters: set[AssetType] | None) -> None:
+        """Update the popup checks without rebuilding the widget."""
+        self.active_filters: set[AssetType] = set(active_filters) if active_filters else set()
+        self._updating = True
+        for tid, cb in self.checkboxes.items():
+            with QSignalBlocker(cb):
+                cb.setChecked(tid in self.active_filters)
+        for cat_name in self.categories:
+            self._update_category_state(cat_name)
+        self._updating = False
+
+    @override
+    def mouseReleaseEvent(self, a0: QMouseEvent | None) -> None:
+        if a0 is None:
+            return
+        action = self.actionAt(a0.pos())
+        if isinstance(action, QWidgetAction) and action.defaultWidget() == self.scroll_area:
+            return
+        super().mouseReleaseEvent(a0)
+
+    def _on_category_clicked(self, type_ids: list[AssetType], cat_name: str) -> None:
+        if self._updating:
+            return
+        self._updating = True
+
+        checked_count = sum(
+            1 for tid in type_ids if tid in self.checkboxes and self.checkboxes[tid].isChecked()
+        )
+        total_count = sum(1 for tid in type_ids if tid in self.checkboxes)
+        new_state = checked_count < total_count
+
+        for tid in type_ids:
+            if tid in self.checkboxes:
+                cb = self.checkboxes[tid]
+                with QSignalBlocker(cb):
+                    cb.setChecked(new_state)
+                if new_state:
+                    self.active_filters.add(tid)
+                else:
+                    self.active_filters.discard(tid)
+
+        self._update_category_state(cat_name)
+        self._updating = False
+        self.filters_changed.emit(self.active_filters)
+
+    def _on_type_clicked(self, tid: AssetType, cat_name: str, checked: bool) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        if checked:
+            self.active_filters.add(tid)
+        else:
+            self.active_filters.discard(tid)
+
+        self._update_category_state(cat_name)
+        self._updating = False
+        self.filters_changed.emit(self.active_filters)
+
+    def _update_category_state(self, cat_name: str) -> None:
+        cat_cb = self.category_checkboxes[cat_name]
+        type_ids = self.categories[cat_name]
+        checked_count = sum(
+            1 for tid in type_ids if tid in self.checkboxes and self.checkboxes[tid].isChecked()
+        )
+        total_count = sum(1 for tid in type_ids if tid in self.checkboxes)
+
+        with QSignalBlocker(cat_cb):
+            if checked_count == 0:
+                cat_cb.setCheckState(Qt.CheckState.Unchecked)
+            elif checked_count == total_count and total_count > 0:
+                cat_cb.setCheckState(Qt.CheckState.Checked)
+            else:
+                cat_cb.setCheckState(Qt.CheckState.PartiallyChecked)
+
+    def _clear_all(self) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        self.active_filters.clear()
+        for cb in self.checkboxes.values():
+            with QSignalBlocker(cb):
+                cb.setChecked(False)
+        for cat_name in self.categories:
+            self._update_category_state(cat_name)
+        self._updating = False
+        self.filters_changed.emit(self.active_filters)

@@ -1,0 +1,213 @@
+"""Logs window."""
+
+from __future__ import annotations
+
+import sys
+from typing import override
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+    QShowEvent,
+    QTextCharFormat,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+)
+
+from fleasion.localization import tr
+from fleasion.utils import LOGS_DIR, get_icon_path, log_buffer, open_folder, time_tracker
+from fleasion.utils.macos_proxy_helper import HELPER_LOG_DIR
+from fleasion.widgets.spacing import GAP, PANEL_MARGINS
+
+
+class LogsWindow(QDialog):
+    """Logs viewer window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle(tr('ui.gui.logs.logs'))
+        self.resize(600, 400)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+
+        self._last_count = 0
+        self._setup_ui()
+        self._set_icon()
+        self._start_updates()
+
+    def _set_icon(self) -> None:
+        if icon_path := get_icon_path():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(*PANEL_MARGINS)
+        layout.setSpacing(GAP)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(self._get_monospace_font())
+        layout.addWidget(self.text_edit)
+
+        bottom = QHBoxLayout()
+        bottom.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        bottom.setSpacing(GAP)
+
+        copy_btn = QPushButton(tr('ui.gui.logs.copy_all'))
+        copy_btn.setMinimumWidth(max(80, copy_btn.sizeHint().width()))
+        copy_btn.clicked.connect(self._copy_all)
+        bottom.addWidget(copy_btn)
+
+        open_folder_btn = QPushButton(tr('ui.gui.logs.open_log_folder'))
+        open_folder_btn.setMinimumWidth(max(110, open_folder_btn.sizeHint().width()))
+        open_folder_btn.clicked.connect(lambda: open_folder(LOGS_DIR))
+        bottom.addWidget(open_folder_btn)
+
+        if sys.platform == 'darwin':
+            open_helper_logs_btn = QPushButton(tr('ui.gui.logs.open_helper_logs'))
+            open_helper_logs_btn.setMinimumWidth(max(118, open_helper_logs_btn.sizeHint().width()))
+            open_helper_logs_btn.setToolTip(
+                tr('ui.gui.logs.open_the_root_owned_macos_proxy_helper')
+            )
+            open_helper_logs_btn.clicked.connect(lambda: open_folder(HELPER_LOG_DIR))
+            bottom.addWidget(open_helper_logs_btn)
+
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText(tr('ui.gui.logs.search'))
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self._on_search)
+        bottom.addWidget(self._search_input, 1)
+
+        self.time_label = QLabel()
+        self.time_label.setStyleSheet('color: #888; font-size: 9pt;')
+        self._refresh_time_label()
+        bottom.addWidget(self.time_label)
+
+        layout.addLayout(bottom)
+        self.setLayout(layout)
+
+        # Ctrl+F focuses the search bar
+        shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
+        shortcut.activated.connect(self._focus_search)
+
+        # Escape clears + unfocuses search
+        esc = QShortcut(QKeySequence('Escape'), self._search_input)
+        esc.activated.connect(self._clear_search)
+
+    def _get_monospace_font(self) -> QFont:
+        font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        font.setPointSize(10)
+        return font
+
+    def _focus_search(self) -> None:
+        self._search_input.setFocus()
+        self._search_input.selectAll()
+
+    def _clear_search(self) -> None:
+        self._search_input.clear()
+        self.text_edit.setFocus()
+
+    def _on_search(self, text: str) -> None:
+        """Highlight all occurrences of the search text."""
+        extra_selections: list[QTextEdit.ExtraSelection] = []
+
+        if text:
+            highlight_fmt = QTextCharFormat()
+            highlight_fmt.setBackground(QColor('#f5c518'))
+            highlight_fmt.setForeground(QColor('#000000'))
+
+            doc = self.text_edit.document()
+            cursor = doc.find(text)
+            first_cursor = None
+            while not cursor.isNull():
+                if first_cursor is None:
+                    first_cursor = cursor
+                sel = QTextEdit.ExtraSelection()
+                sel.format = highlight_fmt
+                sel.cursor = cursor
+                extra_selections.append(sel)
+                cursor = doc.find(text, cursor)
+
+            if first_cursor:
+                self.text_edit.setTextCursor(first_cursor)
+                self.text_edit.ensureCursorVisible()
+
+        self.text_edit.setExtraSelections(extra_selections)
+
+    def _start_updates(self) -> None:
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._update_logs)
+        self.timer.start(250)
+        self._update_logs()
+
+        self.time_timer = QTimer(self)
+        self.time_timer.timeout.connect(self._refresh_time_label)
+        self.time_timer.start(1000)
+
+    @override
+    def showEvent(self, a0: QShowEvent) -> None:
+        if not self.timer.isActive():
+            self.timer.start(250)
+        if not self.time_timer.isActive():
+            self.time_timer.start(1000)
+
+        self._update_logs()
+        self._refresh_time_label()
+        super().showEvent(a0)
+
+    def _update_logs(self) -> None:
+        count, new_logs = log_buffer.get_since(self._last_count)
+        if count != self._last_count:
+            scrollbar = self.text_edit.verticalScrollBar()
+            was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+
+            new_text = '\n'.join(new_logs)
+            prefix = '\n' if self._last_count > 0 else ''
+
+            cursor = QTextCursor(self.text_edit.document())
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(prefix + new_text)
+
+            self._last_count = count
+
+            if was_at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
+
+            # Re-apply search highlights if a search is active
+            if self._search_input.text():
+                self._on_search(self._search_input.text())
+
+    def _copy_all(self) -> None:
+        QApplication.clipboard().setText(self.text_edit.toPlainText())
+
+    def _refresh_time_label(self) -> None:
+        total = time_tracker.get_total_seconds()
+        self.time_label.setText(
+            tr('ui.gui.logs.time_wasted_value', value0=time_tracker.format_duration(total))
+        )
+
+    @override
+    def closeEvent(self, a0: QCloseEvent) -> None:
+        self.timer.stop()
+        self.time_timer.stop()
+        super().closeEvent(a0)

@@ -1,0 +1,154 @@
+"""Application paths and constants."""
+
+import os
+import sys
+from pathlib import Path
+
+from fleasion.utils.metadata import APP_NAME
+
+# Process and proxy configuration
+if sys.platform == 'darwin':
+    _roblox_process = 'RobloxPlayer'
+    _roblox_studio_process = 'RobloxStudio'
+elif sys.platform.startswith('linux'):
+    _roblox_process = 'sober'
+    _roblox_studio_process = 'RobloxStudioBeta.exe'
+else:
+    _roblox_process = 'RobloxPlayerBeta.exe'
+    _roblox_studio_process = 'RobloxStudioBeta.exe'
+ROBLOX_PROCESS = _roblox_process
+ROBLOX_STUDIO_PROCESS = _roblox_studio_process
+PROXY_TARGET_HOST = 'assetdelivery.roblox.com'
+PROXY_PORT = 443
+MACOS_PROXY_BACKEND_PORT = 58443
+# MVSDsion uses its own Windows backend port so it never collides with Fleasion
+WINDOWS_ENV_PROXY_BACKEND_PORT = 58445
+MACOS_PROXY_HELPER_CONTROL_PORT = 58444
+STRIPPABLE_ASSET_TYPES = {'TexturePack'}
+
+# Icon
+ICON_FILENAME = 'fleasionlogoHR.icns' if sys.platform == 'darwin' else 'fleasionlogoHR.ico'
+
+_LOCAL_APPDATA_OVERRIDE_ARG = '--mvsdsion-user-localappdata='
+_USER_HOME_ENV = 'MVSDSION_USER_HOME'
+
+
+def _get_user_home() -> Path:
+    value = os.environ.get(_USER_HOME_ENV)
+    if value:
+        return Path(os.path.expandvars(value)).expanduser()
+    return Path.home()
+
+
+def _get_local_appdata() -> Path:
+    """Return the intended interactive user's local application-data directory."""
+    for arg in sys.argv[1:]:
+        if arg.startswith(_LOCAL_APPDATA_OVERRIDE_ARG):
+            value = arg.split('=', 1)[1].strip().strip('"')
+            if value:
+                return Path(os.path.expandvars(value))
+
+    if sys.platform == 'darwin':
+        return USER_HOME / 'Library' / 'Application Support'
+
+    local_appdata = os.environ.get('LOCALAPPDATA')
+    if local_appdata:
+        return Path(local_appdata)
+
+    if sys.platform == 'win32':
+        return Path.home() / 'AppData' / 'Local'
+
+    return USER_HOME
+
+
+def _get_config_dir() -> Path:
+    """Return MVSDsion's app configuration directory."""
+    if sys.platform.startswith('linux'):
+        xdg_config_home = os.environ.get('XDG_CONFIG_HOME')
+        if xdg_config_home:
+            return Path(os.path.expandvars(xdg_config_home)).expanduser() / APP_NAME
+        return USER_HOME / '.config' / APP_NAME.casefold()
+    return LOCAL_APPDATA / f'{APP_NAME}NT'
+
+
+# Platform paths
+USER_HOME = _get_user_home()
+LOCAL_APPDATA = _get_local_appdata()
+if sys.platform == 'darwin':
+    _storage_db = USER_HOME / 'Library' / 'Roblox' / 'rbx-storage.db'
+    _storage_db_gdk = USER_HOME / 'Library' / 'RobloxPCGDK' / 'rbx-storage.db'
+elif sys.platform.startswith('linux'):
+    _storage_db = (
+        USER_HOME
+        / '.var'
+        / 'app'
+        / 'org.vinegarhq.Sober'
+        / 'data'
+        / 'sober'
+        / 'appData'
+        / 'rbx-storage.db'
+    )
+    _storage_db_gdk = _storage_db
+else:
+    _storage_db = LOCAL_APPDATA / 'Roblox' / 'rbx-storage.db'
+    # Microsoft Store (GDK) version of Roblox stores its DB here
+    _storage_db_gdk = LOCAL_APPDATA / 'RobloxPCGDK' / 'rbx-storage.db'
+STORAGE_DB = _storage_db
+STORAGE_DB_GDK = _storage_db_gdk
+
+# Application directories
+CONFIG_DIR = _get_config_dir()
+APP_CACHE_DIR = CONFIG_DIR / 'cache'
+FFLAG_CATALOG_CACHE_FILENAME = 'fflag_browser.json'
+CONFIG_FILE = CONFIG_DIR / 'settings.json'
+CONFIGS_FOLDER = CONFIG_DIR / 'configs'
+FASTFLAG_PROFILES_FOLDER = CONFIG_DIR / 'FastFlagProfiles'
+LOGS_DIR = CONFIG_DIR / 'logs'
+LOG_FILE = LOGS_DIR / 'mvsdsion.log'
+
+# Proxy CA cert directory (replaces MITMPROXY_DIR)
+PROXY_CA_DIR = CONFIG_DIR / 'proxy_ca'
+
+# Preserved Proxy tab traffic (rows/requests/responses/highlight state),
+# written when the tab's "Preserve" checkbox is on.
+PROXY_TRAFFIC_FILE = CONFIG_DIR / 'proxy_traffic.json'
+
+# PreJsons
+CLOG_URL = 'https://raw.githubusercontent.com/fleasion/Fleasion/refs/heads/clog/CLOG.json'
+PREJSONS_DIR = CONFIG_DIR / 'PreJsons'
+ORIGINALS_DIR = PREJSONS_DIR / 'originals'
+REPLACEMENTS_DIR = PREJSONS_DIR / 'replacements'
+
+# Modifications
+MODIFICATIONS_JSON = CONFIG_DIR / 'modifications.json'
+MOD_ORIGINALS_DIR = CONFIG_DIR / 'ModOriginals'
+MOD_CACHE_DIR = CONFIG_DIR / 'ModCache'
+
+
+def get_icon_path() -> Path | None:
+    """Get the path to the application icon file."""
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent.parent))
+    candidates = (
+        ('fleasionlogoHR.icns', 'fleasionlogoHR.ico')
+        if sys.platform == 'darwin'
+        else ('fleasionlogoHR.ico', 'fleasionlogoHR.icns')
+    )
+    for filename in candidates:
+        path = base / filename
+        if path.exists():
+            return path
+    return None
+
+
+def program_executable() -> str:
+    """The program file to start again (autostart, shortcuts, restarts).
+
+    With MVSDsion's Rust launcher this is the launcher, not the unpacked copy.
+    """
+    import os
+    import sys
+
+    launcher = os.environ.get('MVSDSION_LAUNCHER', '')
+    if launcher and Path(launcher).is_file():
+        return launcher
+    return sys.executable

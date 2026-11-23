@@ -1,0 +1,1071 @@
+"""Simple 3D OBJ viewer widget using PySide6 OpenGL with display list caching."""
+
+from __future__ import annotations
+
+import math
+import time
+from typing import TYPE_CHECKING, Literal, TypedDict, override
+
+import numpy as np
+import numpy.typing as npt
+from OpenGL import GL
+from OpenGL.error import Error as OpenGLError
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QFocusEvent,
+    QGuiApplication,
+    QKeyEvent,
+    QMouseEvent,
+    QScreen,
+    QShowEvent,
+    QWheelEvent,
+)
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from fleasion.config.values import bool_value
+from fleasion.localization import tr
+from fleasion.utils.logging import log_buffer
+
+from .fps_controls import (
+    KEY_BACKWARD,
+    KEY_DOWN,
+    KEY_FAST,
+    KEY_FORWARD,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_SLOW,
+    KEY_UP,
+    VERTICAL_MOVEMENT_KEYS,
+    WASD_MOVEMENT_KEYS,
+    MovementKey,
+    movement_key_from_event,
+)
+from .gl_format import legacy_gl_format, multisampled_readback_skip_reason, set_perspective
+from .offscreen_gl_widget import OffscreenOpenGLWidget
+
+if TYPE_CHECKING:
+    from fleasion.config.types import SettingsSource
+
+
+type Vec3 = list[float]
+type CameraMode = Literal['orbit', 'fps']
+type FloatVector = npt.NDArray[np.float64]
+type PixelReadback = bytes | bytearray | memoryview | npt.NDArray[np.uint8]
+
+
+class ObjFace(TypedDict):
+    """Indices for one parsed OBJ face."""
+
+    v: list[int]
+    n: list[int]
+
+
+def _screen_refresh_rate(screen: QScreen | None) -> float:
+    return float(screen.refreshRate()) if screen is not None else 60.0
+
+
+def _invalid_vertex_index(index: object, vertex_count: int) -> bool:
+    if not isinstance(index, int):
+        return True
+    return index < 0 or index >= vertex_count
+
+
+def _readback_values(pixel: PixelReadback) -> npt.NDArray[np.uint8]:
+    if isinstance(pixel, bytes | bytearray | memoryview):
+        return np.frombuffer(pixel, dtype=np.uint8)
+    return np.asarray(pixel, dtype=np.uint8).reshape(-1)
+
+
+class ObjViewerWidget(OffscreenOpenGLWidget):
+    """Offscreen OpenGL renderer presented through a normal QWidget."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        # Render into an offscreen framebuffer and let QWidget paint the result.
+        # This avoids both QOpenGLWidget top-level recreation and black native
+        # QOpenGLWindow child surfaces seen on some Windows/AMD configurations.
+        OffscreenOpenGLWidget.__init__(self, parent)
+
+        # Mesh Data
+        self.vertices: list[Vec3] = []
+        self.colors: list[Vec3] = []
+        self.faces: list[ObjFace] = []
+        self.normals: list[Vec3] = []
+        self.face_normals: list[Vec3] = []
+
+        # Camera state (orbit) - Default to a nice 3/4 isometric-style view
+        self.camera_mode: CameraMode = 'orbit'  # 'orbit' or 'fps'
+        self.rotation_x: float = 20.0
+        self.rotation_y: float = -30.0
+        self.zoom: float = -5.0
+
+        # Camera state (fps)
+        self.cam_pos: FloatVector = np.array([0.0, 0.0, 0.0], dtype=float)
+        self.cam_yaw: float = 0.0
+        self.cam_pitch: float = 0.0
+        self.base_speed: float = 0.05  # Optimized for the normalized 1.0 unit model size
+
+        self.auto_rotate: bool = False
+        self.last_pos: QPoint | None = None
+        self.keys_pressed: set[MovementKey] = set()
+        self.last_tick_time = time.time()
+
+        # Display list for cached rendering
+        self.mesh_display_list = 0
+        self.needs_rebuild = False
+        self._gl_context_logged = False
+        self._paint_error_logged = False
+        self._first_resize_logged = False
+        self._first_paint_started_logged = False
+        self._first_paint_completed_logged = False
+        self._first_frame_presented_logged = False
+        self._presentation_watchdog_scheduled = False
+        self.frame_presented.connect(self._on_frame_presented)
+
+        # Display options
+        self.show_wireframe = False
+        self.show_grid = True
+
+        self.setFormat(legacy_gl_format())
+
+        # Main update tick: use the monitor's refresh rate where possible
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._update_tick)
+        try:
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            refresh = _screen_refresh_rate(screen)
+            if not refresh or refresh <= 0:
+                refresh = 60.0
+        except RuntimeError:
+            refresh = 60.0
+        interval_ms = max(1, round(1000.0 / refresh))
+        self.timer.start(interval_ms)
+
+    def get_refresh_interval_ms(self) -> int:
+        """Return a safe refresh interval (ms) based on the current screen or primary screen."""
+        try:
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            refresh = _screen_refresh_rate(screen)
+            if not refresh or refresh <= 0:
+                refresh = 60.0
+        except RuntimeError:
+            refresh = 60.0
+        return max(1, round(1000.0 / refresh))
+
+    def load_obj_data(self, obj_content: str) -> None:
+        """Load OBJ file content."""
+        self._discard_mesh_display_list()
+        self.vertices = []
+        self.colors = []
+        self.faces = []
+        self.normals = []
+        self.face_normals = []
+
+        for raw_line in obj_content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            if parts[0] == 'v':
+                self.vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                # Vertex Colors support
+                if len(parts) >= 7:
+                    self.colors.append([float(parts[4]), float(parts[5]), float(parts[6])])
+                else:
+                    self.colors.append([1.0, 1.0, 1.0])  # Default white color fallback
+            elif parts[0] == 'vn':
+                self.normals.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif parts[0] == 'f':
+                face_v: list[int] = []
+                face_n: list[int] = []
+                # Triangulated support
+                for part in parts[1:]:
+                    indices = part.split('/')
+                    face_v.append(int(indices[0]) - 1)
+                    if len(indices) >= 3 and indices[2]:
+                        face_n.append(int(indices[2]) - 1)
+
+                if len(face_v) >= 3:
+                    self.faces.append({'v': face_v, 'n': face_n})
+
+        if self.vertices:
+            self._normalize_model()
+            self._compute_face_normals()
+
+        # Retain angles between meshes, but cleanly exit FPS mode & reset distance
+        if self.camera_mode == 'fps':
+            self.camera_mode = 'orbit'
+            self.rotation_x = self.cam_pitch
+            self.rotation_y = self.cam_yaw
+        self.zoom = -5.0
+
+        # Mark for display list rebuild
+        self.needs_rebuild = True
+        self.update()
+
+    def _normalize_model(self) -> None:
+        """Center and normalize model to fit in view."""
+        if not self.vertices:
+            return
+
+        vertices: npt.NDArray[np.float64] = np.array(self.vertices)
+        center = vertices.mean(axis=0)
+        vertices -= center
+
+        max_dim = np.abs(vertices).max()
+        if max_dim > 0:
+            vertices /= max_dim
+
+        self.vertices = vertices.tolist()
+
+    def _compute_face_normals(self) -> None:
+        """Pre-compute face normals for performance with bounds checks.
+
+        Vectorized: one numpy pass instead of a cross product per face (was the
+        slowest part of opening the Skins tab). Faces with fewer than three or
+        invalid indices, and degenerate faces, get the default up normal.
+        """
+        self.face_normals = []
+        if not self.vertices:
+            return
+        vertices: npt.NDArray[np.float64] = np.array(self.vertices, dtype=np.float64)
+        v_count = len(vertices)
+        up = (0.0, 1.0, 0.0)
+        tris = np.zeros((len(self.faces), 3), dtype=np.int64)
+        valid = np.zeros(len(self.faces), dtype=bool)
+        for row, face in enumerate(self.faces):
+            first = face.get('v', [])[:3]
+            if len(first) == 3 and not any(_invalid_vertex_index(idx, v_count) for idx in first):
+                tris[row] = first
+                valid[row] = True
+        v0, v1, v2 = vertices[tris[:, 0]], vertices[tris[:, 1]], vertices[tris[:, 2]]
+        normals = np.cross(v1 - v0, v2 - v0)
+        lengths = np.linalg.norm(normals, axis=1)
+        good = valid & (lengths > 0)
+        result = np.tile(up, (len(self.faces), 1))
+        result[good] = normals[good] / lengths[good, None]
+        self.face_normals = result.tolist()
+
+    def _build_display_list(self) -> None:
+        """Build display list for fast rendering."""
+        self._discard_mesh_display_list(make_current=False)
+
+        self.mesh_display_list = GL.glGenLists(1)
+        GL.glNewList(self.mesh_display_list, GL.GL_COMPILE)
+
+        if self.vertices and self.faces:
+            GL.glBegin(GL.GL_TRIANGLES)
+
+            for i, face in enumerate(self.faces):
+                v_indices = face['v']
+                n_indices = face['n']
+
+                # Only explicitly rendering triangles to optimize glBegin calls
+                if len(v_indices) < 3:
+                    continue
+
+                # Fallback to face normals if vertex normals missing
+                if not n_indices and i < len(self.face_normals):
+                    GL.glNormal3fv(self.face_normals[i])
+
+                for j in range(3):
+                    v_idx = v_indices[j]
+                    if 0 <= v_idx < len(self.vertices):
+                        if self.colors:
+                            GL.glColor3fv(self.colors[v_idx])
+                        if n_indices and j < len(n_indices) and n_indices[j] < len(self.normals):
+                            GL.glNormal3fv(self.normals[n_indices[j]])
+                        GL.glVertex3fv(self.vertices[v_idx])
+
+            GL.glEnd()
+
+        GL.glEndList()
+        self.needs_rebuild = False
+
+    @override
+    def initializeGL(self) -> None:
+        """Initialize OpenGL with high quality lighting."""
+        self._log_gl_context_once()
+        self._schedule_presentation_watchdog()
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glEnable(GL.GL_LIGHTING)
+        GL.glEnable(GL.GL_LIGHT0)  # Key Light
+        GL.glEnable(GL.GL_LIGHT1)  # Fill Light
+        GL.glEnable(GL.GL_LIGHT2)  # Rim Light
+        GL.glEnable(GL.GL_COLOR_MATERIAL)
+        GL.glEnable(GL.GL_NORMALIZE)
+        GL.glColorMaterial(GL.GL_FRONT_AND_BACK, GL.GL_AMBIENT_AND_DIFFUSE)
+        GL.glLightModeli(GL.GL_LIGHT_MODEL_TWO_SIDE, GL.GL_TRUE)  # Better inside shading
+
+        # 1. Main Key Light (Warm, strong)
+        GL.glLightfv(GL.GL_LIGHT0, GL.GL_POSITION, [1.0, 1.0, 1.0, 0.0])
+        GL.glLightfv(GL.GL_LIGHT0, GL.GL_AMBIENT, [0.15, 0.15, 0.15, 1.0])
+        GL.glLightfv(GL.GL_LIGHT0, GL.GL_DIFFUSE, [0.85, 0.8, 0.75, 1.0])  # Slightly warm
+        GL.glLightfv(GL.GL_LIGHT0, GL.GL_SPECULAR, [0.6, 0.6, 0.6, 1.0])
+
+        # 2. Fill Light (Cool, weaker)
+        GL.glLightfv(GL.GL_LIGHT1, GL.GL_POSITION, [-1.0, 0.5, -1.0, 0.0])
+        GL.glLightfv(GL.GL_LIGHT1, GL.GL_DIFFUSE, [0.2, 0.25, 0.35, 1.0])  # Slightly cool
+        GL.glLightfv(GL.GL_LIGHT1, GL.GL_SPECULAR, [0.1, 0.1, 0.1, 1.0])
+
+        # 3. Rim / Back Light (Bright, emphasizes edges)
+        GL.glLightfv(GL.GL_LIGHT2, GL.GL_POSITION, [0.0, 1.0, -2.0, 0.0])
+        GL.glLightfv(GL.GL_LIGHT2, GL.GL_DIFFUSE, [0.4, 0.4, 0.5, 1.0])
+        GL.glLightfv(GL.GL_LIGHT2, GL.GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
+
+        # Specular material settings - increase shininess to make it look less chalky
+        GL.glMaterialfv(GL.GL_FRONT_AND_BACK, GL.GL_SPECULAR, [0.6, 0.6, 0.6, 1.0])
+        GL.glMaterialf(GL.GL_FRONT_AND_BACK, GL.GL_SHININESS, 64.0)
+
+        GL.glClearColor(0.12, 0.12, 0.15, 1.0)
+        GL.glShadeModel(GL.GL_SMOOTH)
+        error = GL.glGetError()
+        log_buffer.log(
+            'OpenGL',
+            f'OBJ viewer initializeGL complete; gl_error={self._gl_error_text(error)}; '
+            f'{self._surface_state()}',
+        )
+
+    def _gl_context_details(self) -> str:
+        context = self.context()
+        if context is None:
+            msg = 'OpenGL context is unavailable'
+            raise RuntimeError(msg)
+        fmt = context.format()
+        version = GL.glGetString(GL.GL_VERSION)
+        renderer = GL.glGetString(GL.GL_RENDERER)
+        vendor = GL.glGetString(GL.GL_VENDOR)
+        return (
+            f'{fmt.majorVersion()}.{fmt.minorVersion()} '
+            f'profile={fmt.profile().name} '
+            f'renderable={fmt.renderableType().name} '
+            f'samples={fmt.samples()} '
+            f'depth={fmt.depthBufferSize()} stencil={fmt.stencilBufferSize()} '
+            f'alpha={fmt.alphaBufferSize()} swap={fmt.swapBehavior().name} '
+            f'swap_interval={fmt.swapInterval()} context_valid={context.isValid()} '
+            f'version={version.decode(errors="replace") if version else "unknown"} '
+            f'renderer={renderer.decode(errors="replace") if renderer else "unknown"} '
+            f'vendor={vendor.decode(errors="replace") if vendor else "unknown"}'
+        )
+
+    def _log_gl_context_once(self) -> None:
+        if self._gl_context_logged:
+            return
+        self._gl_context_logged = True
+        try:
+            details = self._gl_context_details()
+        except (RuntimeError, OpenGLError) as exc:
+            log_buffer.log('OpenGL', f'Could not read OBJ viewer context details: {exc}')
+        else:
+            log_buffer.log('OpenGL', f'OBJ viewer context: {details}')
+
+    @staticmethod
+    def _gl_error_text(error: int) -> str:
+        return 'GL_NO_ERROR' if error == GL.GL_NO_ERROR else f'0x{int(error):04X}'
+
+    def _surface_state(self) -> str:
+        try:
+            size = self.size()
+            context = self.context()
+            context_valid = bool(context and context.isValid())
+            return (
+                f'size={size.width()}x{size.height()} '
+                f'dpr={self.devicePixelRatio():.2f} '
+                f'visible={self.isVisible()} exposed={self.isExposed()} '
+                f'context_valid={context_valid} fbo={self.defaultFramebufferObject()}'
+            )
+        except RuntimeError as exc:
+            return f'state_unavailable={type(exc).__name__}: {exc}'
+
+    def _center_pixel_description(self) -> str:
+        size = self.size()
+        x = max(0, size.width() // 2)
+        y = max(0, size.height() // 2)
+        pixel = GL.glReadPixels(x, y, 1, 1, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
+        values = _readback_values(pixel)
+        if values.size < 4:
+            return f'unexpected_readback_size={values.size}'
+        return f'rgba=({values[0]},{values[1]},{values[2]},{values[3]})'
+
+    def _sample_center_pixel(self) -> str:
+        """Sample one rendered pixel so logs can separate rendering from presentation."""
+        try:
+            skip_reason = multisampled_readback_skip_reason()
+            if skip_reason is not None:
+                return skip_reason
+            return self._center_pixel_description()
+        except (RuntimeError, TypeError, ValueError, OpenGLError) as exc:
+            return f'readback_failed={type(exc).__name__}: {exc}'
+
+    def _schedule_presentation_watchdog(self) -> None:
+        if self._presentation_watchdog_scheduled:
+            return
+        self._presentation_watchdog_scheduled = True
+        QTimer.singleShot(2000, self._log_presentation_watchdog)
+
+    def _log_presentation_watchdog(self) -> None:
+        log_buffer.log(
+            'OpenGL',
+            (
+                'OBJ viewer presentation after 2000 ms: '
+                f'paint_started={self._first_paint_started_logged} '
+                f'paint_completed={self._first_paint_completed_logged} '
+                f'frame_presented={self._first_frame_presented_logged} '
+                f'{self._surface_state()}'
+            ),
+        )
+
+    def _on_frame_presented(self) -> None:
+        if self._first_frame_presented_logged:
+            return
+        self._first_frame_presented_logged = True
+        log_buffer.log(
+            'OpenGL', f'OBJ viewer first raster frame presented; {self._surface_state()}'
+        )
+
+    @override
+    def resizeGL(self, width: int, height: int) -> None:
+        """Handle standard clean projection resize."""
+        GL.glViewport(0, 0, width, height)
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glLoadIdentity()
+        aspect = width / height if height > 0 else 1.0
+        set_perspective(45.0, aspect, 0.1, 100.0)
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        if not self._first_resize_logged:
+            self._first_resize_logged = True
+            error = GL.glGetError()
+            log_buffer.log(
+                'OpenGL',
+                f'OBJ viewer first resizeGL {width}x{height}; '
+                f'gl_error={self._gl_error_text(error)}; {self._surface_state()}',
+            )
+
+    def _log_first_paint_complete(self) -> None:
+        render_error = GL.glGetError()
+        center_pixel = self._sample_center_pixel()
+        readback_error = GL.glGetError()
+        self._first_paint_completed_logged = True
+        log_buffer.log(
+            'OpenGL',
+            f'OBJ viewer first paintGL complete; '
+            f'render_gl_error={self._gl_error_text(render_error)}; '
+            f'center_pixel={center_pixel}; '
+            f'readback_gl_error={self._gl_error_text(readback_error)}; '
+            f'{self._surface_state()}',
+        )
+
+    @override
+    def paintGL(self) -> None:
+        """Render the scene using cached display list."""
+        first_paint = not self._first_paint_started_logged
+        if first_paint:
+            self._first_paint_started_logged = True
+            log_buffer.log('OpenGL', f'OBJ viewer first paintGL started; {self._surface_state()}')
+        try:
+            self._paint_scene()
+            if first_paint:
+                self._log_first_paint_complete()
+        except (RuntimeError, TypeError, ValueError, OpenGLError) as exc:
+            if not self._paint_error_logged:
+                self._paint_error_logged = True
+                log_buffer.log('OpenGL', f'OBJ viewer paint failed: {type(exc).__name__}: {exc}')
+            try:
+                GL.glClearColor(0.08, 0.08, 0.10, 1.0)
+                GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+            except OpenGLError:
+                pass
+
+    def _paint_scene(self) -> None:
+        """Render the scene using cached display list."""
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+        GL.glLoadIdentity()
+
+        self._draw_background()
+
+        # Camera Transform setup
+        if self.camera_mode == 'orbit':
+            GL.glTranslatef(0.0, 0.0, self.zoom)
+            GL.glRotatef(self.rotation_x, 1.0, 0.0, 0.0)
+            GL.glRotatef(self.rotation_y, 0.0, 1.0, 0.0)
+        else:
+            # FPS Look & Move transform
+            GL.glRotatef(self.cam_pitch, 1.0, 0.0, 0.0)
+            GL.glRotatef(self.cam_yaw, 0.0, 1.0, 0.0)
+            GL.glTranslatef(-self.cam_pos[0], -self.cam_pos[1], -self.cam_pos[2])
+
+        if self.vertices and self.faces:
+            if self.needs_rebuild:
+                self._build_display_list()
+
+            if self.mesh_display_list != 0:
+                if self.show_wireframe:
+                    GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
+                    GL.glPolygonOffset(1.0, 1.0)
+
+                GL.glCallList(self.mesh_display_list)
+
+                if self.show_wireframe:
+                    GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+                    GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
+                    GL.glDisable(GL.GL_LIGHTING)
+
+                    # Prevent over-exposure by using blending + thin lines
+                    GL.glPushAttrib(GL.GL_ENABLE_BIT | GL.GL_COLOR_BUFFER_BIT | GL.GL_LINE_BIT)
+                    GL.glEnable(GL.GL_BLEND)
+                    GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+                    # Note: we use glBlendColor if we wanted, but since list overrides
+                    # glColor3fv, we just lower the alpha of everything drawn.
+                    # Actually standard OpenGL allows constant alpha blending:
+                    GL.glBlendColor(1.0, 1.0, 1.0, 0.75)
+                    GL.glBlendFunc(GL.GL_CONSTANT_ALPHA, GL.GL_ONE_MINUS_CONSTANT_ALPHA)
+
+                    try:
+                        GL.glLineWidth(0.5)
+                    except OpenGLError:
+                        pass  # Some drivers don't support width < 1.0
+
+                    GL.glCallList(self.mesh_display_list)
+
+                    GL.glPopAttrib()
+                    GL.glEnable(GL.GL_LIGHTING)
+                    GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
+
+        if self.show_grid:
+            self._draw_grid()
+
+        # Draw XYZ axis indicator
+        self._draw_axis_indicator()
+
+    def _draw_background(self) -> None:
+        """Draw a subtle gradient background for better depth perception."""
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPushMatrix()
+        GL.glLoadIdentity()
+        GL.glOrtho(-1, 1, -1, 1, -1, 1)
+
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        GL.glPushMatrix()
+        GL.glLoadIdentity()
+
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDepthMask(GL.GL_FALSE)
+
+        GL.glBegin(GL.GL_QUADS)
+        # Top color (darker)
+        GL.glColor3f(0.12, 0.12, 0.15)
+        GL.glVertex3f(-1.0, 1.0, 0.0)
+        GL.glVertex3f(1.0, 1.0, 0.0)
+        # Bottom color (lighter/bluish)
+        GL.glColor3f(0.25, 0.25, 0.30)
+        GL.glVertex3f(1.0, -1.0, 0.0)
+        GL.glVertex3f(-1.0, -1.0, 0.0)
+        GL.glEnd()
+
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glEnable(GL.GL_LIGHTING)
+
+        GL.glPopMatrix()
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPopMatrix()
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+
+    def _draw_grid(self) -> None:
+        """Draw a subtle floor grid to provide spatial context."""
+        GL.glPushAttrib(GL.GL_ALL_ATTRIB_BITS)
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+
+        GL.glColor4f(1.0, 1.0, 1.0, 0.08)  # Very subtle white lines
+        GL.glLineWidth(1.0)
+
+        grid_size = 2.0
+        grid_step = 0.25
+
+        # Draw on the XZ plane slightly below the model
+        bottom_y = -1.0
+
+        GL.glBegin(GL.GL_LINES)
+        val = -grid_size
+        while val <= grid_size + 0.001:
+            # Lines parallel to Z
+            if abs(val) < 0.01:
+                GL.glColor4f(1.0, 0.2, 0.2, 0.15)  # X axis highlight
+            else:
+                GL.glColor4f(1.0, 1.0, 1.0, 0.08)
+            GL.glVertex3f(val, bottom_y, -grid_size)
+            GL.glVertex3f(val, bottom_y, grid_size)
+
+            # Lines parallel to X
+            if abs(val) < 0.01:
+                GL.glColor4f(0.2, 0.4, 1.0, 0.15)  # Z axis highlight
+            else:
+                GL.glColor4f(1.0, 1.0, 1.0, 0.08)
+            GL.glVertex3f(-grid_size, bottom_y, val)
+            GL.glVertex3f(grid_size, bottom_y, val)
+
+            val += grid_step
+        GL.glEnd()
+
+        GL.glPopAttrib()
+
+    def _draw_axis_indicator(self) -> None:
+        """Draw XYZ axis indicator in bottom left corner."""
+        GL.glPushAttrib(GL.GL_ALL_ATTRIB_BITS)
+        GL.glPushMatrix()
+
+        # FETCH the true physical viewport so High-DPI screens don't bug out
+        current_viewport = GL.glGetIntegerv(GL.GL_VIEWPORT)
+
+        indicator_size = 80
+        margin = 10
+        GL.glViewport(margin, margin, indicator_size, indicator_size)
+
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPushMatrix()
+        GL.glLoadIdentity()
+        GL.glOrtho(-2, 2, -2, 2, -10, 10)
+
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        GL.glLoadIdentity()
+
+        # Apply same rotation as main model logic
+        if self.camera_mode == 'orbit':
+            GL.glRotatef(self.rotation_x, 1.0, 0.0, 0.0)
+            GL.glRotatef(self.rotation_y, 0.0, 1.0, 0.0)
+        else:
+            GL.glRotatef(self.cam_pitch, 1.0, 0.0, 0.0)
+            GL.glRotatef(self.cam_yaw, 0.0, 1.0, 0.0)
+
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glLineWidth(2.0)
+
+        axis_length = 1.5
+
+        # X axis (red)
+        GL.glColor3f(1.0, 0.2, 0.2)
+        GL.glBegin(GL.GL_LINES)
+        GL.glVertex3f(0, 0, 0)
+        GL.glVertex3f(axis_length, 0, 0)
+        GL.glEnd()
+
+        # Y axis (green)
+        GL.glColor3f(0.2, 1.0, 0.2)
+        GL.glBegin(GL.GL_LINES)
+        GL.glVertex3f(0, 0, 0)
+        GL.glVertex3f(0, axis_length, 0)
+        GL.glEnd()
+
+        # Z axis (blue)
+        GL.glColor3f(0.2, 0.4, 1.0)
+        GL.glBegin(GL.GL_LINES)
+        GL.glVertex3f(0, 0, 0)
+        GL.glVertex3f(0, 0, axis_length)
+        GL.glEnd()
+
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPopMatrix()
+
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        GL.glPopMatrix()
+        GL.glPopAttrib()
+
+        # Safely restore the exact viewport OpenGL was using
+        GL.glViewport(
+            current_viewport[0],
+            current_viewport[1],
+            current_viewport[2],
+            current_viewport[3],
+        )
+
+    def _is_movement_pressed(self, movement_key: MovementKey) -> bool:
+        """Check if a normalized movement key is currently held."""
+        return movement_key in self.keys_pressed
+
+    @override
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """Handle FPS movement entry using physical scan codes for layout independence."""
+        movement_key = movement_key_from_event(event)
+
+        if self.camera_mode == 'orbit':
+            if movement_key in WASD_MOVEMENT_KEYS:
+                self._transition_to_fps()
+                # After transition, handle the key normally
+            elif movement_key in VERTICAL_MOVEMENT_KEYS:
+                # Ignore these keys while in orbit mode
+                return
+            # For all other keys (including non-FPS keys), continue to normal handling
+
+        # Store the normalized movement key for continuous movement polling
+        if movement_key is not None:
+            self.keys_pressed.add(movement_key)
+        super().keyPressEvent(event)
+
+    @override
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        movement_key = movement_key_from_event(event)
+        if movement_key is not None:
+            self.keys_pressed.discard(movement_key)
+        super().keyReleaseEvent(event)
+
+    @override
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        self.keys_pressed.clear()
+        super().focusOutEvent(event)
+
+    @override
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse press."""
+        self.last_pos = event.pos()
+
+    @override
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse drag."""
+        if self.last_pos is None:
+            return
+
+        dx = event.pos().x() - self.last_pos.x()
+        dy = event.pos().y() - self.last_pos.y()
+
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            if self.camera_mode == 'orbit':
+                self.rotation_x += dy * 0.5
+                self.rotation_y += dx * 0.5
+            else:
+                self.cam_pitch += dy * 0.5
+                self.cam_yaw += dx * 0.5
+            self.update()
+
+        self.last_pos = event.pos()
+
+    @override
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Handle mouse wheel."""
+        delta = event.angleDelta().y()
+        if self.camera_mode == 'orbit':
+            self.zoom += delta / 120.0
+            self.zoom = max(-50.0, min(-0.1, self.zoom))
+        else:
+            speed = self.base_speed * 5.0 * (delta / 120.0)
+            yaw = math.radians(self.cam_yaw)
+            pitch = math.radians(self.cam_pitch)
+
+            # Mathematical inverse calculation from camera to world directional vectors
+            forward = np.array(
+                [
+                    math.cos(pitch) * math.sin(yaw),
+                    -math.sin(pitch),
+                    -math.cos(pitch) * math.cos(yaw),
+                ]
+            )
+            self.cam_pos += forward * speed
+
+        self.update()
+
+    def set_auto_rotate(self, enabled: bool) -> None:
+        """Enable/disable auto-rotation."""
+        self.auto_rotate = enabled
+        if enabled and self.camera_mode == 'fps':
+            self.reset_view()
+
+    def _transition_to_fps(self) -> None:
+        """Seamlessly convert Orbit camera transformations into FPS transformations."""
+        if self.camera_mode == 'fps':
+            return
+        self.camera_mode = 'fps'
+        self.auto_rotate = False
+
+        # Normalize angles to [-180, 180] so the transition doesn't cause a view flick
+        pitch = self.rotation_x % 360.0
+        if pitch > 180.0:
+            pitch -= 360.0
+        yaw = self.rotation_y % 360.0
+        if yaw > 180.0:
+            yaw -= 360.0
+
+        self.cam_pitch = pitch
+        self.cam_yaw = yaw
+
+        rx = math.radians(pitch)
+        ry = math.radians(yaw)
+
+        # Calculates camera coordinate backwards cleanly utilizing inverted matrices
+        px = self.zoom * math.cos(rx) * math.sin(ry)
+        py = -self.zoom * math.sin(rx)
+        pz = -self.zoom * math.cos(rx) * math.cos(ry)
+
+        self.cam_pos = np.array([px, py, pz], dtype=float)
+
+    def _update_tick(self) -> None:
+        """Update loop handles smooth movements independent of framerate UI stalls."""
+        needs_update = False
+
+        current_time = time.time()
+        dt = current_time - self.last_tick_time
+        self.last_tick_time = current_time
+        if dt > 0.1:
+            dt = 0.016
+
+        if self.camera_mode == 'orbit':
+            if self.auto_rotate:
+                self.rotation_y += 62.5 * dt
+                needs_update = True
+
+        elif self.camera_mode == 'fps':
+            speed = self.base_speed * (dt * 62.5)
+
+            if self._is_movement_pressed(KEY_FAST):
+                speed *= 3.0
+            if self._is_movement_pressed(KEY_SLOW):
+                speed *= 0.33
+
+            moved = False
+            yaw = math.radians(self.cam_yaw)
+            pitch = math.radians(self.cam_pitch)
+
+            # Properly transposed camera vectors allows Unity-style flycam controls
+            forward = np.array(
+                [
+                    math.cos(pitch) * math.sin(yaw),
+                    -math.sin(pitch),
+                    -math.cos(pitch) * math.cos(yaw),
+                ]
+            )
+            right = np.array([math.cos(yaw), 0.0, math.sin(yaw)])
+            up = np.array([0.0, 1.0, 0.0])  # Native World Up
+
+            if self._is_movement_pressed(KEY_FORWARD):
+                self.cam_pos += forward * speed
+                moved = True
+            if self._is_movement_pressed(KEY_BACKWARD):
+                self.cam_pos -= forward * speed
+                moved = True
+            if self._is_movement_pressed(KEY_LEFT):
+                self.cam_pos -= right * speed
+                moved = True
+            if self._is_movement_pressed(KEY_RIGHT):
+                self.cam_pos += right * speed
+                moved = True
+            if self._is_movement_pressed(KEY_UP):
+                self.cam_pos += up * speed
+                moved = True
+            if self._is_movement_pressed(KEY_DOWN):
+                # Only fly down if no extension keys (Ctrl, Alt, Win) are held
+                mods = QGuiApplication.keyboardModifiers()
+                if not (
+                    mods
+                    & (
+                        Qt.KeyboardModifier.ControlModifier
+                        | Qt.KeyboardModifier.AltModifier
+                        | Qt.KeyboardModifier.MetaModifier
+                    )
+                ):
+                    self.cam_pos -= up * speed
+                    moved = True
+
+            if moved:
+                needs_update = True
+
+        if needs_update:
+            self.update()
+
+    def reset_view(self) -> None:
+        """Reset camera to default view."""
+        self.camera_mode = 'orbit'
+        self.rotation_x = 20.0
+        self.rotation_y = -30.0
+        self.zoom = -5.0
+        self.update()
+
+    def toggle_wireframe(self, enabled: bool) -> None:
+        self.show_wireframe = enabled
+        self.update()
+
+    def toggle_grid(self, enabled: bool) -> None:
+        self.show_grid = enabled
+        self.update()
+
+    def clear(self) -> None:
+        """Clear the mesh data and display list."""
+        self.vertices = []
+        self.colors = []
+        self.faces = []
+        self.normals = []
+        self.face_normals = []
+        self.camera_mode = 'orbit'
+        self.rotation_x = 20.0
+        self.rotation_y = -30.0
+        self.zoom = -5.0
+
+        self._discard_mesh_display_list()
+        self.needs_rebuild = False
+        self.update()
+
+    def _discard_mesh_display_list(self, make_current: bool = True) -> None:
+        if self.mesh_display_list == 0:
+            return
+
+        display_list = self.mesh_display_list
+        self.mesh_display_list = 0
+        made_current = False
+        try:
+            if make_current and self.context() is not None:
+                self.makeCurrent()
+                made_current = True
+            GL.glDeleteLists(display_list, 1)
+        except RuntimeError, OpenGLError:
+            pass
+        finally:
+            if made_current:
+                try:
+                    self.doneCurrent()
+                except RuntimeError:
+                    pass
+
+    @override
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Stop updates and release the display list before context teardown."""
+        self.timer.stop()
+        self._discard_mesh_display_list()
+        OffscreenOpenGLWidget.closeEvent(self, event)
+
+
+class ObjViewerPanel(QWidget):
+    """Panel with 3D viewer and controls."""
+
+    clear_requested = Signal()
+
+    def __init__(
+        self, parent: QWidget | None = None, config_manager: SettingsSource | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.config_manager = config_manager
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        """Setup UI."""
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # 3D Viewer
+        self.viewer = ObjViewerWidget()
+        if self.config_manager:
+            # Ensure settings exist and are saved if missing
+            updated = False
+            if 'obj_show_wireframe' not in self.config_manager.settings:
+                self.config_manager.settings['obj_show_wireframe'] = False
+                updated = True
+            if 'obj_show_grid' not in self.config_manager.settings:
+                self.config_manager.settings['obj_show_grid'] = True
+                updated = True
+
+            if updated:
+                self.config_manager.save()
+
+            self.viewer.show_wireframe = bool_value(
+                self.config_manager.settings.get('obj_show_wireframe', False)
+            )
+            self.viewer.show_grid = bool_value(
+                self.config_manager.settings.get('obj_show_grid', True), default=True
+            )
+        layout.addWidget(self.viewer, stretch=1)
+
+        # Controls
+        controls_layout = QHBoxLayout()
+
+        # Original default buttons
+        reset_btn = QPushButton(tr('ui.cache.obj_viewer.reset_view'))
+        reset_btn.clicked.connect(self.viewer.reset_view)
+        controls_layout.addWidget(reset_btn)
+
+        self.options_btn = QPushButton(tr('ui.cache.obj_viewer.options'))
+        self.options_menu = QMenu(self)
+
+        self.action_auto_rotate = self.options_menu.addAction(tr('ui.cache.obj_viewer.auto_rotate'))
+        self.action_auto_rotate.setCheckable(True)
+        self.action_auto_rotate.toggled.connect(self.viewer.set_auto_rotate)
+
+        self.action_wireframe = self.options_menu.addAction(tr('ui.cache.obj_viewer.wireframe'))
+        self.action_wireframe.setCheckable(True)
+        self.action_wireframe.setChecked(self.viewer.show_wireframe)
+        self.action_wireframe.toggled.connect(self._toggle_wireframe_and_save)
+
+        self.action_grid = self.options_menu.addAction(tr('ui.cache.obj_viewer.grid'))
+        self.action_grid.setCheckable(True)
+        self.action_grid.setChecked(self.viewer.show_grid)
+        self.action_grid.toggled.connect(self._toggle_grid_and_save)
+
+        self.options_btn.setMenu(self.options_menu)
+        controls_layout.addWidget(self.options_btn)
+
+        controls_layout.addStretch()
+
+        # Vertex/Face counts
+        self.stats_label = QLabel('')
+        controls_layout.addWidget(self.stats_label)
+
+        # Clean native Help Button AFTER the stats
+        self.help_btn = QPushButton(tr('ui.cache.obj_viewer.text'))
+        self.help_btn.setMaximumWidth(30)  # Keep it perfectly square/small but native height
+        self.help_btn.setToolTip(tr('ui.cache.obj_viewer.view_camera_controls'))
+        self.help_btn.clicked.connect(self.show_help)
+        controls_layout.addWidget(self.help_btn)
+
+        layout.addLayout(controls_layout)
+        self.setLayout(layout)
+
+    def show_help(self) -> None:
+        """Show a cleanly formatted message box with controls."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle(tr('ui.cache.obj_viewer.camera_controls'))
+        msg.setText(tr('ui.cache.obj_viewer.h3_orbit_mode_default_h3_ul_li'))
+        msg.exec()
+
+    def _toggle_wireframe_and_save(self, enabled: bool) -> None:
+        self.viewer.toggle_wireframe(enabled)
+        if self.config_manager:
+            self.config_manager.settings['obj_show_wireframe'] = enabled
+            self.config_manager.save()
+
+    def _toggle_grid_and_save(self, enabled: bool) -> None:
+        self.viewer.toggle_grid(enabled)
+        if self.config_manager:
+            self.config_manager.settings['obj_show_grid'] = enabled
+            self.config_manager.save()
+
+    def load_obj(self, obj_content: str, asset_id: str = '') -> None:
+        """Load OBJ file content."""
+        del asset_id
+        self.viewer.load_obj_data(obj_content)
+
+        v_count = len(self.viewer.vertices)
+        f_count = len(self.viewer.faces)
+        self.stats_label.setText(
+            tr('ui.cache.obj_viewer.value_verts_value_faces', value0=v_count, value1=f_count)
+        )
+
+    @override
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self.viewer.update()
+
+    def clear(self) -> None:
+        """Clear the viewer."""
+        self.viewer.clear()
+        self.stats_label.setText('')

@@ -1,0 +1,540 @@
+"""Certificate generation and management using the cryptography library.
+
+Generates a local CA and per-host leaf certificates for TLS MITM interception.
+No openssl binary required - everything is done in-process.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import ipaddress
+import logging
+import os
+from typing import TYPE_CHECKING, Protocol, cast
+
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+    from cryptography.hazmat.primitives.asymmetric.types import (
+        CertificateIssuerPrivateKeyTypes,
+        PrivateKeyTypes,
+    )
+
+
+class _SerializationModule(Protocol):
+    Encoding: type[serialization.Encoding]
+    PublicFormat: type[serialization.PublicFormat]
+
+
+class _RsaModule(Protocol):
+    RSAPublicKey: type[rsa.RSAPublicKey]
+
+
+logger = logging.getLogger(__name__)
+
+# Hosts we intercept - certs are pre-generated for these at startup
+INTERCEPTED_HOSTS = (
+    'assetdelivery.roblox.com',
+    'fts.rbxcdn.com',
+    'contentdelivery.roblox.com',
+    'gamejoin.roblox.com',
+    'apis.roblox.com',
+    'thumbnails.roblox.com',
+)
+
+# Regenerate certs slightly before hard expiry so users do not hit sudden TLS failures.
+CA_MIN_REMAINING_DAYS = 30
+LEAF_MIN_REMAINING_DAYS = 7
+LEAF_CERT_VALIDITY_DAYS = 825
+NOT_VALID_BEFORE_SKEW_MINUTES = 5
+
+
+def _secure_private_key_permissions(path: Path) -> None:
+    """Restrict an existing private-key file to its owner on POSIX platforms."""
+    if os.name != 'nt' and path.exists():
+        path.chmod(0o600)
+
+
+def _write_private_key(path: Path, data: bytes) -> None:
+    """Write private-key bytes without creating a world-readable window."""
+    if os.name != 'nt':
+        path.touch(mode=0o600, exist_ok=True)
+        path.chmod(0o600)
+    path.write_bytes(data)
+
+
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    """Normalize X.509 datetime values to timezone-aware UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
+
+
+def _cert_valid_for(cert: x509.Certificate, min_remaining_days: int) -> bool:
+    """Return True if cert is currently valid and has enough time remaining."""
+    now = dt.datetime.now(dt.UTC)
+
+    not_before_utc = getattr(cert, 'not_valid_before_utc', None)
+    not_after_utc = getattr(cert, 'not_valid_after_utc', None)
+    if not_before_utc is None:
+        not_before_utc = _as_utc(cert.not_valid_before)
+    if not_after_utc is None:
+        not_after_utc = _as_utc(cert.not_valid_after)
+
+    if not (not_before_utc <= now <= not_after_utc):
+        return False
+
+    min_remaining = dt.timedelta(days=min_remaining_days)
+    return (not_after_utc - now) > min_remaining
+
+
+def _cert_matches_private_key(
+    cert: x509.Certificate,
+    private_key: PrivateKeyTypes,
+    serialization: _SerializationModule,
+) -> bool:
+    """Return True if *private_key* matches *cert*'s public key."""
+    cert_pub = cert.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    key_pub = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return cert_pub == key_pub
+
+
+def _leaf_signed_by_ca(
+    leaf_cert: x509.Certificate,
+    ca_cert: x509.Certificate,
+    rsa_mod: _RsaModule,
+) -> bool:
+    """Return True if *leaf_cert* verifies with *ca_cert*'s public key."""
+    ca_public_key = ca_cert.public_key()
+    signature_hash_algorithm = leaf_cert.signature_hash_algorithm
+    if signature_hash_algorithm is None:
+        return False
+
+    if isinstance(ca_public_key, rsa_mod.RSAPublicKey):
+        ca_public_key.verify(
+            leaf_cert.signature,
+            leaf_cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            signature_hash_algorithm,
+        )
+        return True
+
+    if isinstance(ca_public_key, ec.EllipticCurvePublicKey):
+        ca_public_key.verify(
+            leaf_cert.signature,
+            leaf_cert.tbs_certificate_bytes,
+            ec.ECDSA(signature_hash_algorithm),
+        )
+        return True
+
+    # Unsupported key types are treated as invalid for reuse checks.
+    return False
+
+
+def _safe_cert_filename(name: str) -> str:
+    safe = ''.join(ch if ch.isalnum() or ch in '._-' else '_' for ch in name.strip())
+    return safe or 'certificate'
+
+
+def _normalise_hosts(hosts: Iterable[str]) -> list[str]:
+    normalized = sorted({str(host).strip().lower() for host in hosts if str(host).strip()})
+    if not normalized:
+        msg = 'at least one host is required'
+        raise ValueError(msg)
+    return normalized
+
+
+def _san_entries_for_hosts(hosts: Iterable[str]) -> list[x509.GeneralName]:
+    san_entries: list[x509.GeneralName] = []
+    for host in _normalise_hosts(hosts):
+        try:
+            san_entries.append(x509.IPAddress(ipaddress.ip_address(host)))
+        except ValueError:
+            san_entries.append(x509.DNSName(host))
+    return san_entries
+
+
+def _cert_san_names(cert: x509.Certificate) -> tuple[set[str], set[str]]:
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        return set(), set()
+    san_dns = {name.lower() for name in san.get_values_for_type(x509.DNSName)}
+    san_ips = {str(ip) for ip in san.get_values_for_type(x509.IPAddress)}
+    return san_dns, san_ips
+
+
+def _cert_allows_server_auth(cert: x509.Certificate) -> bool:
+    try:
+        eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    except x509.ExtensionNotFound:
+        # Absence of EKU is less restrictive than a wrong EKU
+        return True
+    return ExtendedKeyUsageOID.SERVER_AUTH in eku
+
+
+def _cert_has_authority_key_identifier(cert: x509.Certificate) -> bool:
+    try:
+        cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+    except x509.ExtensionNotFound:
+        return False
+    return True
+
+
+def _cert_has_subject_key_identifier(cert: x509.Certificate) -> bool:
+    try:
+        cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    except x509.ExtensionNotFound:
+        return False
+    return True
+
+
+def _cert_covers_hosts(cert: x509.Certificate, hosts: Iterable[str]) -> bool:
+    san_dns, san_ips = _cert_san_names(cert)
+    for host in _normalise_hosts(hosts):
+        try:
+            ip = str(ipaddress.ip_address(host))
+        except ValueError:
+            if host not in san_dns:
+                return False
+        else:
+            if ip not in san_ips:
+                return False
+    return True
+
+
+def generate_ca(ca_dir: Path) -> tuple[Path, Path]:
+    """Generate a CA key + self-signed cert and save to ca_dir.
+
+    Returns (ca_cert_path, ca_key_path).  Skips generation if both files
+    already exist (so Roblox doesn't need to re-import the cert on every run).
+    """
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    ca_cert_path = ca_dir / 'ca.crt'
+    ca_key_path = ca_dir / 'ca.key'
+
+    if ca_cert_path.exists() and ca_key_path.exists():
+        try:
+            existing_ca = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
+            existing_key = load_pem_private_key(ca_key_path.read_bytes(), password=None)
+        except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+            logger.warning('Failed to load existing Fleasion CA; regenerating (%s)', exc)
+        else:
+            reusable = all(
+                (
+                    _cert_matches_private_key(existing_ca, existing_key, serialization),
+                    _cert_valid_for(existing_ca, CA_MIN_REMAINING_DAYS),
+                    _cert_has_subject_key_identifier(existing_ca),
+                )
+            )
+            if reusable:
+                _secure_private_key_permissions(ca_key_path)
+                return ca_cert_path, ca_key_path
+            logger.warning('Existing Fleasion CA is stale or mismatched; regenerating')
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, 'Fleasion Proxy CA'),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'Fleasion'),
+        ]
+    )
+    now = dt.datetime.now(dt.UTC)
+    not_valid_before = now - dt.timedelta(minutes=NOT_VALID_BEFORE_SKEW_MINUTES)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_valid_before)
+        .not_valid_after(now + dt.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=True,
+                crl_sign=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(key, hashes.SHA256())
+    )
+
+    ca_cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    _write_private_key(
+        ca_key_path,
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ),
+    )
+    logger.info('Generated new Fleasion CA cert at %s', ca_cert_path)
+    return ca_cert_path, ca_key_path
+
+
+def generate_host_cert(
+    host: str, ca_cert_path: Path, ca_key_path: Path, ca_dir: Path
+) -> tuple[Path, Path]:
+    """Generate a leaf certificate for *host* signed by our CA.
+
+    Returns (cert_path, key_path).  Uses cached files if they already exist.
+    """
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    safe_host = host.replace('*', '_wildcard_')
+    cert_path = ca_dir / f'{safe_host}.crt'
+    key_path = ca_dir / f'{safe_host}.key'
+    _secure_private_key_permissions(ca_key_path)
+
+    # Load CA once here so we can validate cached leaf cert issuer before reusing it.
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
+
+    if cert_path.exists() and key_path.exists():
+        try:
+            cached_leaf = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            cached_key = load_pem_private_key(key_path.read_bytes(), password=None)
+        except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+            logger.warning(
+                'Failed to validate cached leaf cert for %s; regenerating (%s)',
+                host,
+                exc,
+            )
+        else:
+            cn_values = cached_leaf.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            cn_ok = bool(cn_values and cn_values[0].value == host)
+            san_dns, san_ips = _cert_san_names(cached_leaf)
+            try:
+                signature_ok = _leaf_signed_by_ca(cached_leaf, ca_cert, rsa)
+            except InvalidSignature, TypeError, ValueError, UnsupportedAlgorithm:
+                signature_ok = False
+            reusable = all(
+                (
+                    cn_ok,
+                    host in san_dns or host in san_ips,
+                    cached_leaf.issuer == ca_cert.subject,
+                    _cert_valid_for(cached_leaf, LEAF_MIN_REMAINING_DAYS),
+                    _cert_matches_private_key(cached_leaf, cached_key, serialization),
+                    _cert_has_subject_key_identifier(cached_leaf),
+                    _cert_has_authority_key_identifier(cached_leaf),
+                    signature_ok,
+                )
+            )
+            if reusable:
+                _secure_private_key_permissions(key_path)
+                return cert_path, key_path
+            logger.warning('Cached leaf cert for %s is stale or mismatched; regenerating', host)
+
+    # Load CA
+    ca_key = load_pem_private_key(ca_key_path.read_bytes(), password=None)
+
+    if not _cert_matches_private_key(ca_cert, ca_key, serialization):
+        msg = 'CA cert/key pair is mismatched'
+        raise ValueError(msg)
+    # A CA key used here is a certificate issuer key; the loader's union is broader.
+    ca_signing_key = cast('CertificateIssuerPrivateKeyTypes', ca_key)
+
+    # Generate a fresh key for this leaf cert
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = dt.datetime.now(dt.UTC)
+    not_valid_before = now - dt.timedelta(minutes=NOT_VALID_BEFORE_SKEW_MINUTES)
+
+    san_entries = _san_entries_for_hosts([host])
+
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+        .issuer_name(ca_cert.subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_valid_before)
+        .not_valid_after(now + dt.timedelta(days=LEAF_CERT_VALIDITY_DAYS))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_signing_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=False,
+                crl_sign=False,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        .sign(ca_signing_key, hashes.SHA256())
+    )
+
+    cert_path.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
+    _write_private_key(
+        key_path,
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ),
+    )
+    logger.debug('Generated leaf cert for %s', host)
+    return cert_path, key_path
+
+
+def generate_multi_host_cert(
+    cert_name: str,
+    hosts: Iterable[str],
+    ca_cert_path: Path,
+    ca_key_path: Path,
+    ca_dir: Path,
+) -> tuple[Path, Path]:
+    """Generate a reusable leaf certificate whose SAN covers every host."""
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    normalized_hosts = _normalise_hosts(hosts)
+    safe_name = _safe_cert_filename(cert_name)
+    cert_path = ca_dir / f'{safe_name}.crt'
+    key_path = ca_dir / f'{safe_name}.key'
+    _secure_private_key_permissions(ca_key_path)
+
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
+
+    if cert_path.exists() and key_path.exists():
+        try:
+            cached_leaf = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            cached_key = load_pem_private_key(key_path.read_bytes(), password=None)
+        except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+            logger.warning(
+                'Failed to validate cached multi-host cert %s; regenerating (%s)',
+                cert_name,
+                exc,
+            )
+        else:
+            cn_values = cached_leaf.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            cn_ok = bool(cn_values and cn_values[0].value == cert_name)
+            try:
+                signature_ok = _leaf_signed_by_ca(cached_leaf, ca_cert, rsa)
+            except InvalidSignature, TypeError, ValueError, UnsupportedAlgorithm:
+                signature_ok = False
+            reusable = all(
+                (
+                    cn_ok,
+                    cached_leaf.issuer == ca_cert.subject,
+                    _cert_valid_for(cached_leaf, LEAF_MIN_REMAINING_DAYS),
+                    _cert_matches_private_key(cached_leaf, cached_key, serialization),
+                    _cert_covers_hosts(cached_leaf, normalized_hosts),
+                    _cert_allows_server_auth(cached_leaf),
+                    _cert_has_subject_key_identifier(cached_leaf),
+                    _cert_has_authority_key_identifier(cached_leaf),
+                    signature_ok,
+                )
+            )
+            if reusable:
+                _secure_private_key_permissions(key_path)
+                return cert_path, key_path
+            logger.warning(
+                'Cached multi-host cert %s is stale or mismatched; regenerating',
+                cert_name,
+            )
+
+    ca_key = load_pem_private_key(ca_key_path.read_bytes(), password=None)
+    if not _cert_matches_private_key(ca_cert, ca_key, serialization):
+        msg = 'CA cert/key pair is mismatched'
+        raise ValueError(msg)
+    # A CA key used here is a certificate issuer key; the loader's union is broader.
+    ca_signing_key = cast('CertificateIssuerPrivateKeyTypes', ca_key)
+
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = dt.datetime.now(dt.UTC)
+    not_valid_before = now - dt.timedelta(minutes=NOT_VALID_BEFORE_SKEW_MINUTES)
+
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cert_name)]))
+        .issuer_name(ca_cert.subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_valid_before)
+        .not_valid_after(now + dt.timedelta(days=LEAF_CERT_VALIDITY_DAYS))
+        .add_extension(
+            x509.SubjectAlternativeName(_san_entries_for_hosts(normalized_hosts)),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_signing_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=False,
+                crl_sign=False,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        .sign(ca_signing_key, hashes.SHA256())
+    )
+
+    cert_path.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
+    _write_private_key(
+        key_path,
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ),
+    )
+    logger.debug('Generated multi-host cert %s for %s', cert_name, ', '.join(normalized_hosts))
+    return cert_path, key_path
+
+
+def get_ca_pem(ca_cert_path: Path) -> str:
+    """Return the CA certificate as a PEM string."""
+    return ca_cert_path.read_text(encoding='utf-8')
