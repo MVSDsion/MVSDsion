@@ -1,0 +1,66 @@
+name: Discord release notification
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send release to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_AUTHOR: ${{ github.event.release.author.login }}
+          RELEASE_PUBLISHED_AT: ${{ github.event.release.published_at }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+          if not webhook:
+              raise SystemExit("Missing repository Actions secret: DISCORD_WEBHOOK_URL")
+
+          tag = os.environ["RELEASE_TAG"]
+          name = os.environ.get("RELEASE_NAME") or tag
+          body = os.environ.get("RELEASE_BODY") or "No release notes provided."
+          if len(body) > 4000:
+              body = body[:3997] + "..."
+
+          prerelease = os.environ.get("RELEASE_PRERELEASE") == "true"
+          embed = {
+              "title": f"{'Pre-release' if prerelease else 'New release'}: {name}",
+              "url": os.environ["RELEASE_URL"],
+              "description": body,
+              "color": 0xF1C40F if prerelease else 0x2ECC71,
+              "fields": [
+                  {"name": "Tag", "value": tag, "inline": True},
+                  {"name": "Published by", "value": os.environ["RELEASE_AUTHOR"], "inline": True},
+              ],
+          }
+          if os.environ.get("RELEASE_PUBLISHED_AT"):
+              embed["timestamp"] = os.environ["RELEASE_PUBLISHED_AT"]
+
+          request = urllib.request.Request(
+              webhook,
+              data=json.dumps({
+                  "embeds": [embed],
+                  "allowed_mentions": {"parse": []},
+              }).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=15) as response:
+              if response.status not in (200, 204):
+                  raise SystemExit(f"Discord returned HTTP {response.status}")
+          PY
