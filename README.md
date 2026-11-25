@@ -1,7 +1,7 @@
 # MVSDsion
 
 MVSDsion gives your weapons new looks in the Roblox game
-[MVSD](https://www.roblox.com/games/12355337193/). Pick a skin, turn it on,
+[Murderers VS Sheriffs Duels](https://www.roblox.com/games/12355337193/). Pick a skin, turn it on,
 and you see it in the game. Only you see the skins – other players still see
 the normal weapons.
 
